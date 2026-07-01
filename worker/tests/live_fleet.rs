@@ -142,12 +142,22 @@ async fn live_fleet_consumes_and_checkpoints() {
 
     assert!(total >= 5, "expected >= 5 records, got {total}");
 
-    // Per-shard ordering (DynamoDB Streams guarantees order WITHIN a shard only).
+    // Per-shard ordering (DynamoDB Streams guarantees order WITHIN a shard only)
+    // AND exactly-once: no record re-delivered across the extra cycles, because
+    // each shard task resumed from its persisted checkpoint.
     for (shard, recs) in m.iter() {
         let seqs: Vec<String> = recs.iter().map(|(s, _)| s.clone()).collect();
         let mut sorted = seqs.clone();
         sorted.sort_by(|a, b| seq_ord(a, b));
         assert_eq!(&seqs, &sorted, "shard {shard} records out of order");
+
+        let mut distinct = sorted.clone();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            seqs.len(),
+            "shard {shard} re-delivered records across cycles (checkpoint resume failed)"
+        );
     }
 
     // Payloads flowed through the fleet (NewImage present → non-empty data).
@@ -184,17 +194,21 @@ async fn run_fleet(
     );
 
     // A fresh on-demand table's stream shard is open (no SHARD_END), so the
-    // drain never "completes"; drive bounded cycles until records appear, then
-    // stop after the first record-producing cycle for a clean single-pass
-    // ordering assertion (re-reading from TRIM_HORIZON each cycle would
-    // otherwise re-deliver the same records).
+    // drain never "completes"; drive cycles until records appear, then run a few
+    // MORE cycles to prove the fleet does NOT re-deliver — each shard task
+    // resumes from its persisted checkpoint, not from TRIM_HORIZON.
     let mut coordinator = LeaseCoordinator::new("fleet-w1".to_string(), 100, 60_000);
     let start = std::time::Instant::now();
-    for _ in 0..25 {
+    let mut confirm_cycles = 0;
+    for _ in 0..15 {
         let now_ms = start.elapsed().as_millis() as u64;
         let _ = fleet.run_cycle(&mut coordinator, now_ms).await?;
-        if sink.lock().unwrap().values().map(|v| v.len()).sum::<usize>() >= 5 {
-            break;
+        let total: usize = sink.lock().unwrap().values().map(|v| v.len()).sum();
+        if total >= 5 {
+            confirm_cycles += 1;
+            if confirm_cycles >= 3 {
+                break; // ran extra cycles past first delivery — enough to catch re-delivery
+            }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }

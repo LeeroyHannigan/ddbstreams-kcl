@@ -19,6 +19,10 @@ pub struct RawLease {
     pub owner: Option<String>,
     pub lease_counter: u64,
     pub completed: bool,
+    /// Opaque resume checkpoint (`None` = start at `TRIM_HORIZON`). The
+    /// coordinator ignores this; the fleet uses it to resume a shard task from
+    /// the last persisted position instead of re-reading from the beginning.
+    pub checkpoint: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -110,7 +114,7 @@ mod tests {
     const DUR: u64 = 1000;
 
     fn row(key: &str, owner: Option<&str>, counter: u64, completed: bool) -> RawLease {
-        RawLease { lease_key: key.into(), owner: owner.map(|o| o.into()), lease_counter: counter, completed }
+        RawLease { lease_key: key.into(), owner: owner.map(|o| o.into()), lease_counter: counter, completed, checkpoint: None }
     }
 
     // Balanced by count (w1: a,b; w2: c,d) so load-balancing never triggers —

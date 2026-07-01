@@ -74,10 +74,15 @@ where
         let rows = self.leases.list().await?;
         let owner = self.config.owner.as_str();
         let has_lease: HashSet<ShardId> = rows.iter().map(|r| r.lease_key.clone()).collect();
-        let mut owned: std::collections::HashMap<ShardId, u64> = rows
+        // shard -> (lease counter, resume checkpoint). The checkpoint lets a
+        // task resume where the last owner left off instead of re-reading from
+        // TRIM_HORIZON — essential for correctness across cycles and, critically,
+        // across a process restart (the in-memory iterator is gone, but the
+        // persisted checkpoint survives).
+        let mut owned: std::collections::HashMap<ShardId, (u64, Option<String>)> = rows
             .iter()
             .filter(|r| r.owner.as_deref() == Some(owner) && !r.completed)
-            .map(|r| (r.lease_key.clone(), r.lease_counter))
+            .map(|r| (r.lease_key.clone(), (r.lease_counter, r.checkpoint.clone())))
             .collect();
         let completed: HashSet<ShardId> = rows
             .iter()
@@ -99,7 +104,7 @@ where
             }
             if !has_lease.contains(&meta.id) && !owned.contains_key(&meta.id) {
                 if let Ok(h) = self.leases.acquire(&meta.id, owner).await {
-                    owned.insert(meta.id.clone(), h.counter);
+                    owned.insert(meta.id.clone(), (h.counter, h.checkpoint));
                 }
             }
         }
@@ -107,23 +112,38 @@ where
         // 3) Run one concurrent task per owned + eligible shard.
         let mut set: JoinSet<()> = JoinSet::new();
         for meta in &shards {
-            let Some(&counter) = owned.get(&meta.id) else { continue };
+            let Some((counter, checkpoint)) = owned.get(&meta.id).cloned() else { continue };
             if !eligible(meta, &completed) {
                 continue;
             }
             let src = self.source.clone();
             let lease = self.leases.clone();
             let processor = self.factory.create(&meta.id);
-            let owner = self.config.owner.clone();
-            let shard = meta.id.clone();
-            let poll = self.config.poll_interval_ms;
+            let task = ShardTask {
+                owner: self.config.owner.clone(),
+                shard: meta.id.clone(),
+                counter,
+                checkpoint,
+                poll_interval_ms: self.config.poll_interval_ms,
+            };
             set.spawn(async move {
-                let _ = process_shard(src, lease, processor, owner, shard, counter, poll).await;
+                let _ = process_shard(src, lease, processor, task).await;
             });
         }
         while set.join_next().await.is_some() {}
         Ok(false)
     }
+}
+
+/// Per-shard task parameters (kept in one struct so the spawn signature stays
+/// small and the fields are named at the call site).
+struct ShardTask {
+    owner: String,
+    shard: ShardId,
+    counter: u64,
+    /// Resume position from the lease (`None` = TRIM_HORIZON).
+    checkpoint: Option<String>,
+    poll_interval_ms: u64,
 }
 
 /// Drive a single shard: deliver records in order, checkpoint/heartbeat under the
@@ -133,17 +153,18 @@ async fn process_shard<S, L>(
     source: Arc<S>,
     leases: Arc<L>,
     mut processor: Box<dyn RecordProcessor + Send>,
-    owner: String,
-    shard: ShardId,
-    mut counter: u64,
-    poll_interval_ms: u64,
+    task: ShardTask,
 ) -> Result<(), WorkerError>
 where
     S: AsyncStreamSource,
     L: AsyncLeaseStore,
 {
+    let ShardTask { owner, shard, mut counter, checkpoint, poll_interval_ms } = task;
     processor.initialize(&shard);
-    let mut after: Option<String> = None;
+    // Resume from the lease's persisted checkpoint (None = TRIM_HORIZON for a
+    // brand-new shard). This is what makes re-processing idempotent across
+    // cycles and correct across a restart.
+    let mut after: Option<String> = checkpoint;
     loop {
         let batch = source.get_records(&shard, after.clone()).await?;
         if !batch.records.is_empty() {
@@ -212,6 +233,7 @@ mod tests {
         owner: Option<String>,
         counter: u64,
         completed: bool,
+        checkpoint: Option<String>,
     }
     #[derive(Default)]
     struct FakeLeases {
@@ -228,6 +250,7 @@ mod tests {
                 owner: r.owner.clone(),
                 lease_counter: r.counter,
                 completed: r.completed,
+                checkpoint: r.checkpoint.clone(),
             }).collect())
         }
         async fn acquire(&self, key: &str, owner: &str) -> Result<LeaseHandle, WorkerError> {
@@ -235,7 +258,7 @@ mod tests {
             let r = rows.entry(key.to_string()).or_default();
             r.owner = Some(owner.to_string());
             r.counter += 1;
-            Ok(LeaseHandle { owner: owner.to_string(), counter: r.counter, checkpoint: None })
+            Ok(LeaseHandle { owner: owner.to_string(), counter: r.counter, checkpoint: r.checkpoint.clone() })
         }
         async fn renew(&self, key: &str, _o: &str, counter: u64) -> Result<u64, WorkerError> {
             let mut rows = self.rows.lock().unwrap();
@@ -246,6 +269,7 @@ mod tests {
         async fn checkpoint(&self, key: &str, _o: &str, counter: u64, _s: &str) -> Result<u64, WorkerError> {
             let mut rows = self.rows.lock().unwrap();
             let r = rows.get_mut(key).ok_or("no lease")?;
+            r.checkpoint = Some(_s.to_string());
             r.counter = counter + 1;
             Ok(r.counter)
         }
@@ -331,5 +355,54 @@ mod tests {
         // Both processed; child only after parent completed (separate cycles).
         assert_eq!(m.get("p").unwrap(), &vec!["1"]);
         assert_eq!(m.get("c").unwrap(), &vec!["2"]);
+    }
+
+    /// An always-open shard (never SHARD_END) that honors `after`, so it can be
+    /// polled across multiple cycles like a real live shard.
+    struct OpenSource {
+        records: Vec<Record>,
+    }
+    #[async_trait::async_trait]
+    impl AsyncStreamSource for OpenSource {
+        async fn describe_shards(&self) -> Result<Vec<ShardMeta>, WorkerError> {
+            Ok(vec![ShardMeta { id: "s0".into(), parents: vec![] }])
+        }
+        async fn get_records(&self, _shard: &str, after: Option<String>) -> Result<RecordBatch, WorkerError> {
+            let records = match after {
+                None => self.records.clone(),
+                Some(tok) => match self.records.iter().position(|r| r.seq == tok) {
+                    Some(i) => self.records[i + 1..].to_vec(),
+                    None => self.records.clone(),
+                },
+            };
+            Ok(RecordBatch { records, shard_end: false })
+        }
+    }
+
+    #[tokio::test]
+    async fn fleet_resumes_from_checkpoint_no_redelivery() {
+        // A shard that never closes: across multiple cycles it must NOT re-deliver
+        // records already past the persisted checkpoint. This is the correctness
+        // guarantee that also holds across a process restart (the checkpoint lives
+        // in the lease table, not in memory).
+        let source = OpenSource { records: vec![rec("s0", "1"), rec("s0", "2"), rec("s0", "3")] };
+        let sink: Sink = Arc::new(Mutex::new(HashMap::new()));
+        let factory = Arc::new(RecordingFactory { sink: sink.clone() });
+        let fleet = Fleet::new(
+            source,
+            FakeLeases::default(),
+            factory,
+            FleetConfig { owner: "w1".into(), max_leases: 100, lease_duration_ms: 100_000, poll_interval_ms: 1 },
+        );
+
+        // Run several cycles; the shard stays open so it's revisited each cycle.
+        fleet.run_until_complete(5).await.unwrap();
+
+        let m = sink.lock().unwrap();
+        assert_eq!(
+            m.get("s0").unwrap(),
+            &vec!["1", "2", "3"],
+            "each record delivered exactly once across cycles (resumed from checkpoint)"
+        );
     }
 }

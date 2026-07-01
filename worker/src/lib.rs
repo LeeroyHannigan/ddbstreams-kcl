@@ -232,6 +232,7 @@ mod tests {
                     owner: r.owner.clone(),
                     lease_counter: r.counter,
                     completed: r.completed,
+                    checkpoint: r.checkpoint.clone(),
                 })
                 .collect())
         }

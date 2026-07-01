@@ -13,13 +13,29 @@ use crate::{build_shard_graph, close_open_parents, DdbShard};
 use aws_sdk_dynamodbstreams::types::ShardIteratorType;
 use aws_sdk_dynamodbstreams::Client;
 use ddbstreams_kcl_core::{Record, RecordBatch, ShardMeta};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A threaded shard iterator: the `next_shard_iterator` handed back by the last
+/// `GetRecords`, plus the logical position (`after`) it continues from. Reusing
+/// it avoids a `GetShardIterator` call per poll — this is KCL's
+/// `DynamoDBStreamsDataFetcher` behavior (hold the iterator, re-derive only on
+/// reposition/expiry).
+#[derive(Clone)]
+struct Cursor {
+    /// The `after` checkpoint this iterator continues from (`None` = TRIM_HORIZON).
+    after: Option<String>,
+    iterator: String,
+}
 
 /// A live DynamoDB Streams source bound to one stream ARN.
 pub struct DdbStreamsSource {
     client: Client,
     stream_arn: String,
+    /// Per-shard threaded iterators (shard id -> next iterator + its position).
+    cursors: Mutex<HashMap<String, Cursor>>,
 }
 
 impl DdbStreamsSource {
@@ -27,6 +43,7 @@ impl DdbStreamsSource {
         Self {
             client,
             stream_arn: stream_arn.into(),
+            cursors: Mutex::new(HashMap::new()),
         }
     }
 
@@ -78,7 +95,11 @@ impl DdbStreamsSource {
         Ok(build_shard_graph(vec![normalized]))
     }
 
-    async fn shard_iterator(
+    /// Derive a *fresh* iterator from the stream via `GetShardIterator`
+    /// (`AFTER_SEQUENCE_NUMBER` when resuming from a checkpoint, else
+    /// `TRIM_HORIZON`). Used on first read, reposition, or after an
+    /// expired/trimmed iterator — not on the steady-state poll path.
+    async fn derive_iterator(
         &self,
         shard: &str,
         after: Option<&str>,
@@ -99,41 +120,87 @@ impl DdbStreamsSource {
         Ok(resp.shard_iterator().map(|s| s.to_string()))
     }
 
+    /// Return a reusable threaded iterator for `shard` iff a cached cursor
+    /// continues from exactly the requested `after` position. A mismatch means
+    /// the caller is repositioning (or this is a fresh/restarted process), so we
+    /// must not reuse.
+    fn cached_iterator(&self, shard: &str, after: Option<&str>) -> Option<String> {
+        let cursors = self.cursors.lock().unwrap();
+        cursors
+            .get(shard)
+            .filter(|c| c.after.as_deref() == after)
+            .map(|c| c.iterator.clone())
+    }
+
+    fn store_cursor(&self, shard: &str, after: Option<String>, iterator: Option<String>) {
+        let mut cursors = self.cursors.lock().unwrap();
+        match iterator {
+            Some(it) => {
+                cursors.insert(shard.to_string(), Cursor { after, iterator: it });
+            }
+            None => {
+                cursors.remove(shard); // SHARD_END → nothing more to thread.
+            }
+        }
+    }
+
+    fn drop_cursor(&self, shard: &str) {
+        self.cursors.lock().unwrap().remove(shard);
+    }
+
     /// One `GetRecords` round after the opaque checkpoint `after` (`None` =
     /// `TRIM_HORIZON`). Returns the batch and whether the shard is closed
     /// (`next_shard_iterator == None` → SHARD_END).
     ///
-    /// Self-heals the two recoverable iterator failures the adapter is expected
-    /// to handle: `TrimmedDataAccessException` and `ExpiredIteratorException` →
-    /// restart the shard at `TRIM_HORIZON` (matches `DynamoDBStreamsDataFetcher`).
+    /// Reuses the threaded `next_shard_iterator` from the previous poll when it
+    /// continues from the same `after` (avoiding a `GetShardIterator` per call);
+    /// otherwise derives a fresh iterator. Self-heals the two recoverable
+    /// iterator failures the adapter is expected to handle:
+    /// `TrimmedDataAccessException` and `ExpiredIteratorException` → drop the
+    /// stale cursor and restart from `after`/`TRIM_HORIZON` (matches
+    /// `DynamoDBStreamsDataFetcher`).
     pub async fn get_records(
         &self,
         shard: &str,
         after: Option<&str>,
     ) -> Result<RecordBatch, BoxError> {
-        let iterator = match self.shard_iterator(shard, after).await {
-            Ok(Some(it)) => it,
-            Ok(None) => return Ok(RecordBatch { records: vec![], shard_end: true }),
-            Err(e) if is_recoverable(&e) && after.is_some() => {
-                // Checkpoint too old / iterator expired → restart at TRIM_HORIZON.
-                match self.shard_iterator(shard, None).await? {
-                    Some(it) => it,
-                    None => return Ok(RecordBatch { records: vec![], shard_end: true }),
+        // 1) Obtain an iterator: reuse the threaded one, else derive fresh.
+        let iterator = match self.cached_iterator(shard, after) {
+            Some(it) => it,
+            None => match self.derive_iterator(shard, after).await {
+                Ok(Some(it)) => it,
+                Ok(None) => {
+                    self.drop_cursor(shard);
+                    return Ok(RecordBatch { records: vec![], shard_end: true });
                 }
-            }
-            Err(e) => return Err(e),
+                Err(e) if is_recoverable(&e) && after.is_some() => {
+                    // Checkpoint too old → restart at TRIM_HORIZON.
+                    match self.derive_iterator(shard, None).await? {
+                        Some(it) => it,
+                        None => return Ok(RecordBatch { records: vec![], shard_end: true }),
+                    }
+                }
+                Err(e) => return Err(e),
+            },
         };
 
+        // 2) GetRecords, self-healing an expired/trimmed threaded iterator once.
         let resp = match self.client.get_records().shard_iterator(&iterator).send().await {
             Ok(r) => r,
             Err(e) => {
                 let be: BoxError = e.into();
                 if is_recoverable(&be) {
-                    // Expired between GetShardIterator and GetRecords → let the
-                    // engine retry on the next describe cycle.
-                    return Ok(RecordBatch { records: vec![], shard_end: false });
+                    // The (possibly cached) iterator expired → drop it and
+                    // re-derive from the checkpoint, retrying once.
+                    self.drop_cursor(shard);
+                    let fresh = match self.derive_iterator(shard, after).await? {
+                        Some(it) => it,
+                        None => return Ok(RecordBatch { records: vec![], shard_end: true }),
+                    };
+                    self.client.get_records().shard_iterator(&fresh).send().await?
+                } else {
+                    return Err(be);
                 }
-                return Err(be);
             }
         };
 
@@ -154,8 +221,14 @@ impl DdbStreamsSource {
                 });
             }
         }
+        // 3) Thread the next iterator. The cursor's logical position advances to
+        // the last delivered seq (or stays at `after` if this poll was empty).
+        let next = resp.next_shard_iterator().map(|s| s.to_string());
+        let new_after =
+            records.last().map(|r| r.seq.clone()).or_else(|| after.map(|s| s.to_string()));
+        self.store_cursor(shard, new_after, next.clone());
         // A closed shard yields no next iterator.
-        let shard_end = resp.next_shard_iterator().is_none();
+        let shard_end = next.is_none();
         Ok(RecordBatch { records, shard_end })
     }
 }

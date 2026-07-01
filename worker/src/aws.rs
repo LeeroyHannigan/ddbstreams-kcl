@@ -36,6 +36,7 @@ impl AsyncLeaseStore for DynamoDbLeaseStore {
                 owner: l.lease_owner,
                 lease_counter: l.lease_counter,
                 completed: l.completed,
+                checkpoint: l.checkpoint,
             })
             .collect())
     }
