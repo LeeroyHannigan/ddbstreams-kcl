@@ -2,10 +2,15 @@
 name = "ddbstreams-kcl-source-ddbstreams"
 version = "0.0.1"
 edition = "2021"
-description = "DynamoDB Streams StreamSource for ddbstreams-kcl-core. Pure DescribeStream shard-graph builder now; the async aws-sdk-dynamodbstreams adapter lands next behind an optional feature."
+description = "DynamoDB Streams StreamSource for ddbstreams-kcl-core. Pure DescribeStream shard-graph logic (always built); the async aws-sdk-dynamodbstreams adapter is behind the optional `aws` feature."
 
-# Kept dependency-free for now so the shard-graph logic builds/tests with zero
-# network. The async AWS SDK adapter (aws-sdk-dynamodbstreams) will be added
-# behind an optional `aws` feature so this pure logic always compiles/tests.
+[features]
+# Enables the live async adapter over aws-sdk-dynamodbstreams. Off by default so
+# the pure shard-graph logic builds/tests with zero network.
+aws = ["dep:aws-config", "dep:aws-sdk-dynamodbstreams", "dep:tokio"]
+
 [dependencies]
 ddbstreams-kcl-core = { path = "../core" }
+aws-config = { version = "1", optional = true }
+aws-sdk-dynamodbstreams = { version = "1", optional = true }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros"] }

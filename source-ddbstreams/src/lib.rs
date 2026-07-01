@@ -12,6 +12,9 @@
 use ddbstreams_kcl_core::{ShardId, ShardMeta};
 use std::collections::HashSet;
 
+#[cfg(feature = "aws")]
+pub mod aws;
+
 /// A shard as returned by DynamoDB Streams `DescribeStream`.
 ///
 /// NOTE: the DynamoDB Streams `Shard` shape exposes a SINGLE `ParentShardId`
