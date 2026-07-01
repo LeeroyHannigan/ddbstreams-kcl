@@ -55,8 +55,10 @@ source for reviewers to verify fidelity.
   - Source: `LeaseCleanupManager.cleanupLeaseForCompletedShard`. **TODO:** encode in `LeaseStore` cleanup contract.
 
 ### Bootstrap & shard sync at scale
-- Empty lease table bootstrap uses `ShardFilter` (`AT_TRIM_HORIZON`/`AT_LATEST`/`AT_TIMESTAMP`) for a snapshot of open shards; incremental sync thereafter via `ChildShards` in `GetRecords` responses; leader-only `PeriodicShardSyncManager`.
-  - Source: KCL 2.3.0+ CHANGELOG; `PeriodicShardSyncManager`.
+- Empty lease table bootstrap creates leases for a snapshot of open shards; incremental sync thereafter via `ChildShards` in `GetRecords` responses; leader-only `PeriodicShardSyncManager`.
+- **ShardFilter (DDB Streams specific):** `DescribeStream` supports the **`CHILD_SHARDS`** filter type (+ `shardId`) to fetch a read-only parent's children directly, avoiding a full paginated re-scan. This differs from Kinesis (`AT_TRIM_HORIZON`/`AT_LATEST`/`AT_TIMESTAMP`). The adapter falls back to full paginated `DescribeStream` if the filtered call errors.
+  - Source: `DynamoDBStreamsShardDetector.listShardsWithFilter` / `describeStreamWithFilter`; KCL 2.3.0+ CHANGELOG.
+  - Encoded: `ShardFilter::child_shards()` + `merge_child_shards()` (source-ddbstreams).
   - Guard: paginated shard enumeration can yield an incomplete hash range if trim horizon advances mid-pagination — validate/retry.
 
 ### DDB Streams specifics
