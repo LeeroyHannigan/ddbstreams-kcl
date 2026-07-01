@@ -69,6 +69,17 @@ source for reviewers to verify fidelity.
   - Encoded: `close_open_parents()` (source-ddbstreams).
   - Source: `DynamoDBStreamsDataFetcher`; KCL Adapter docs.
 
+### Efficiency & runtime primitives
+- **Shard-iterator reuse**: thread the `next_shard_iterator` returned by each `GetRecords` instead of calling `GetShardIterator` per poll; re-derive only on reposition (checkpoint change) or expiry.
+  - Source: `DynamoDBStreamsDataFetcher` (holds the iterator; re-derives on `Trimmed`/`ExpiredIterator`).
+  - Encoded: `DdbStreamsSource` per-shard `Cursor` cache (`cached_iterator`/`store_cursor`), validated against the requested `after`; self-heals expired/trimmed iterators (source-ddbstreams `aws`).
+- **Adaptive catch-up polling**: respect the DDB Streams ~4 `GetRecords`/s/shard throttle (≥250 ms floor) while catching up; back off when idle at the tip.
+  - Source: `DynamoDBStreamsSleepTimeController` / `polling` config.
+  - Encoded: `backoff::PollBackoff` (pure, deterministic) — floor on data, exponential idle backoff to a cap. Primitive ready for the continuous run loop.
+- **Multi-stream lease keys**: namespace the lease key by stream so shard ids don't collide across streams.
+  - Source: `MultiStreamLease` / `StreamIdentifier.serialize()` (`<streamId>:<shardId>`).
+  - Encoded: `multistream::multi_stream_lease_key`/`parse_lease_key`/`shard_of` — reversible, splits on the last colon (DDB shard ids contain none, so a stream ARN's embedded colons are preserved). Single-stream keys are the bare shard id, as the fleet uses today.
+
 ## Operational anti-patterns to avoid (industry/KCL guidance)
 1. Child **processes** not threads per partition (crash isolation) — matches our daemon+IPC design.
 2. Stable lease-owner id (`taskARN:pid` / `podName` / `instanceId:pid`), never hostname.
