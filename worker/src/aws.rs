@@ -27,6 +27,21 @@ impl AsyncLeaseStore for DynamoDbLeaseStore {
             .await?
             .map(|l| LeaseView { completed: l.completed }))
     }
+    async fn list(&self) -> Result<Vec<ddbstreams_kcl_core::coordinator::RawLease>, WorkerError> {
+        Ok(DynamoDbLeaseStore::list_all(self)
+            .await?
+            .into_iter()
+            .map(|l| ddbstreams_kcl_core::coordinator::RawLease {
+                lease_key: l.lease_key,
+                owner: l.lease_owner,
+                lease_counter: l.lease_counter,
+                completed: l.completed,
+            })
+            .collect())
+    }
+    async fn renew(&self, key: &str, owner: &str, counter: u64) -> Result<u64, WorkerError> {
+        DynamoDbLeaseStore::renew(self, key, owner, counter).await.map_err(box_lease)
+    }
     async fn acquire(&self, key: &str, owner: &str) -> Result<LeaseHandle, WorkerError> {
         let l = DynamoDbLeaseStore::acquire(self, key, owner).await.map_err(box_lease)?;
         Ok(LeaseHandle {

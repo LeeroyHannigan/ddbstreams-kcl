@@ -13,6 +13,7 @@ aws = [
 [dependencies]
 ddbstreams-kcl-core = { path = "../core" }
 async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "time", "macros"] }
 ddbstreams-kcl-source-ddbstreams = { path = "../source-ddbstreams", features = ["aws"], optional = true }
 ddbstreams-kcl-lease-dynamodb = { path = "../lease-dynamodb", features = ["aws"], optional = true }
 

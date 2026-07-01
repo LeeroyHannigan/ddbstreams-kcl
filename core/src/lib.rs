@@ -75,6 +75,13 @@ pub trait RecordProcessor {
     fn shard_ended(&mut self, shard: &ShardId);
 }
 
+/// Creates one [`RecordProcessor`] per shard, as KCL does (a
+/// `ShardRecordProcessorFactory`). Each shard's processor owns its own state and
+/// runs on its own task, so the factory must be shareable across tasks.
+pub trait RecordProcessorFactory: Send + Sync {
+    fn create(&self, shard: &ShardId) -> Box<dyn RecordProcessor + Send>;
+}
+
 /// Single-worker scheduler enforcing the ordering guarantees. Multi-host lease
 /// stealing / balancing is a later phase; this proves the ordering core.
 pub struct Scheduler<S: StreamSource, L: LeaseStore> {

@@ -12,10 +12,13 @@
 //! the concrete AWS trait impls live in the `aws` module behind the `aws` feature.
 
 use ddbstreams_kcl_core::{RecordBatch, RecordProcessor, ShardId, ShardMeta};
+use ddbstreams_kcl_core::coordinator::RawLease;
 use std::collections::HashSet;
 
 #[cfg(feature = "aws")]
 pub mod aws;
+
+pub mod fleet;
 
 pub type WorkerError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -49,7 +52,11 @@ pub trait AsyncStreamSource {
 #[async_trait::async_trait]
 pub trait AsyncLeaseStore {
     async fn get(&self, lease_key: &str) -> Result<Option<LeaseView>, WorkerError>;
+    /// Scan all lease rows (for the coordinator's take decisions).
+    async fn list(&self) -> Result<Vec<RawLease>, WorkerError>;
     async fn acquire(&self, lease_key: &str, owner: &str) -> Result<LeaseHandle, WorkerError>;
+    /// Heartbeat: bump the counter conditional on ownership. Returns new counter.
+    async fn renew(&self, lease_key: &str, owner: &str, counter: u64) -> Result<u64, WorkerError>;
     async fn checkpoint(
         &self,
         lease_key: &str,
@@ -213,6 +220,26 @@ mod tests {
     impl AsyncLeaseStore for FakeLeases {
         async fn get(&self, key: &str) -> Result<Option<LeaseView>, WorkerError> {
             Ok(self.rows.lock().unwrap().get(key).map(|r| LeaseView { completed: r.completed }))
+        }
+        async fn list(&self) -> Result<Vec<RawLease>, WorkerError> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(k, r)| RawLease {
+                    lease_key: k.clone(),
+                    owner: r.owner.clone(),
+                    lease_counter: r.counter,
+                    completed: r.completed,
+                })
+                .collect())
+        }
+        async fn renew(&self, key: &str, _owner: &str, counter: u64) -> Result<u64, WorkerError> {
+            let mut rows = self.rows.lock().unwrap();
+            let r = rows.get_mut(key).ok_or("no lease")?;
+            r.counter = counter + 1;
+            Ok(r.counter)
         }
         async fn acquire(&self, key: &str, owner: &str) -> Result<LeaseHandle, WorkerError> {
             let mut rows = self.rows.lock().unwrap();

@@ -89,6 +89,29 @@ impl DynamoDbLeaseStore {
         }
     }
 
+    /// Scan every lease row in the table (used by the coordinator).
+    pub async fn list_all(&self) -> Result<Vec<Lease>, BoxError> {
+        let mut out = Vec::new();
+        let mut start = None;
+        loop {
+            let resp = self
+                .client
+                .scan()
+                .table_name(&self.table)
+                .set_exclusive_start_key(start)
+                .send()
+                .await?;
+            for item in resp.items() {
+                out.push(item_to_lease(item));
+            }
+            start = resp.last_evaluated_key().cloned();
+            if start.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn get(&self, lease_key: &str) -> Result<Option<Lease>, BoxError> {
         let resp = self
             .client
