@@ -14,3 +14,12 @@ ddbstreams-kcl-core = { path = "../core" }
 aws-config = { version = "1", optional = true }
 aws-sdk-dynamodbstreams = { version = "1", optional = true }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros"] }
+
+# For the live integration test (tests/live_ddbstreams.rs, gated by the `aws`
+# feature + DDBSTREAMS_KCL_IT=1). Control-plane client to create/seed/delete a
+# temporary streamed table.
+[dev-dependencies]
+aws-config = { version = "1" }
+aws-sdk-dynamodb = { version = "1" }
+aws-sdk-dynamodbstreams = { version = "1" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
