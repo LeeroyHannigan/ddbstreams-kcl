@@ -90,14 +90,16 @@ async fn live_read_ordered_records() {
     // Best-effort cleanup regardless of assertion outcome.
     let _ = db.delete_table().table_name(&table).send().await;
 
-    let total = result.expect("read from stream");
-    eprintln!("read {total} records from the stream");
+    let (total, payload_ok) = result.expect("read from stream");
+    eprintln!("read {total} records from the stream (payload_ok={payload_ok})");
     assert!(total >= 5, "expected >= 5 records, got {total}");
+    assert!(payload_ok, "expected record payload to decode with the 'pk' key");
 }
 
 /// Discover shards via the adapter and drain records from the root shard(s),
 /// retrying because stream records lag writes by a moment.
-async fn run_read(source: &DdbStreamsSource) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+async fn run_read(source: &DdbStreamsSource) -> Result<(usize, bool), Box<dyn std::error::Error + Send + Sync>> {
+    use ddbstreams_kcl_source_ddbstreams::record::StreamRecord;
     // Retry describe until at least one shard shows up.
     let mut shards = Vec::new();
     for _ in 0..15 {
@@ -111,13 +113,18 @@ async fn run_read(source: &DdbStreamsSource) -> Result<usize, Box<dyn std::error
 
     // Read from root shards (no parents) — a fresh table has a single open shard.
     let mut total = 0usize;
+    let mut payload_ok = false;
     for shard in shards.iter().filter(|s| s.parents.is_empty()) {
         let mut after: Option<String> = None;
         for _ in 0..15 {
             let batch = source.get_records(&shard.id, after.as_deref()).await?;
             if !batch.records.is_empty() {
-                // Records within a shard must arrive in order — record the last
-                // as the next checkpoint (opaque token).
+                // Verify the typed payload decodes and carries the item key.
+                if let Ok(sr) = StreamRecord::decode(&batch.records[0].data) {
+                    if sr.keys.contains_key("pk") {
+                        payload_ok = true;
+                    }
+                }
                 after = Some(batch.records.last().unwrap().seq.clone());
                 total += batch.records.len();
             }
@@ -127,5 +134,5 @@ async fn run_read(source: &DdbStreamsSource) -> Result<usize, Box<dyn std::error
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
-    Ok(total)
+    Ok((total, payload_ok))
 }

@@ -15,6 +15,8 @@ use std::collections::HashSet;
 #[cfg(feature = "aws")]
 pub mod aws;
 
+pub mod record;
+
 /// A shard as returned by DynamoDB Streams `DescribeStream`.
 ///
 /// NOTE: the DynamoDB Streams `Shard` shape exposes a SINGLE `ParentShardId`

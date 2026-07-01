@@ -11,6 +11,8 @@ aws = ["dep:aws-config", "dep:aws-sdk-dynamodbstreams", "dep:tokio"]
 
 [dependencies]
 ddbstreams-kcl-core = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 aws-config = { version = "1", optional = true }
 aws-sdk-dynamodbstreams = { version = "1", optional = true }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros"] }

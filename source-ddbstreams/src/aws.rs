@@ -144,12 +144,13 @@ impl DdbStreamsSource {
                 if seq.is_empty() {
                     continue;
                 }
-                // Payload mapping (Keys/NewImage/OldImage → bytes) is a follow-up;
-                // the engine only needs the ordered sequence + shard for now.
+                // Carry the full typed change record (Keys/NewImage/OldImage/
+                // eventName) as the opaque payload, per KCL's RecordAdapter model.
+                let payload = crate::record::StreamRecord::from_sdk(r).encode();
                 records.push(Record {
                     shard_id: shard.to_string(),
                     seq,
-                    data: Vec::new(),
+                    data: payload,
                 });
             }
         }
