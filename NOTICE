@@ -1,0 +1,15 @@
+ddbstreams-kcl
+Copyright 2026 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+This product's design and algorithms are informed by, and portions may be
+ported from, the following Apache License 2.0 projects:
+
+  - Amazon Kinesis Client Library (KCL)
+    https://github.com/awslabs/amazon-kinesis-client
+    Copyright Amazon.com, Inc. or its affiliates.
+
+  - Amazon DynamoDB Streams Kinesis Adapter
+    https://github.com/awslabs/dynamodb-streams-kinesis-adapter
+    Copyright Amazon.com, Inc. or its affiliates.
+
+Both are licensed under the Apache License, Version 2.0. See LICENSE.

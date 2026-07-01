@@ -1,74 +1,75 @@
 # REFERENCES — authoritative sources for robustness
 
 This engine is **not** a naive reimplementation. Every correctness-critical behavior
-is grounded in the authoritative Java sources we have access to. This file maps each
-behavior to its source so reviewers can verify fidelity.
+is grounded in the authoritative **open-source (Apache-2.0)** sources below, so this
+public repo can cite and port from them cleanly. This file maps each behavior to its
+source for reviewers to verify fidelity.
 
-## Authoritative packages
-| Package | Role | Version referenced |
+> Scope note: we reference only the public Apache-2.0 upstreams. We do **not** copy
+> from any internal/mirror forks. Ported code must retain Apache-2.0 attribution
+> (see LICENSE / NOTICE).
+
+## Authoritative packages (all Apache-2.0)
+| Package | Role | Version |
 |---|---|---|
-| `awslabs/amazon-kinesis-client` (KCL v3) | Lease coordination, shard sync, checkpointing, lifecycle | 3.4.x (`v2.x`+ / internal `kclv3_prism`) |
-| `awslabs/dynamodb-streams-kinesis-adapter` | DDB-Streams-specific shard detection, data fetch, sleep/catch-up, lease mgmt | 2.3.0 (KCL 3.4.3) |
-| `AWSBifrostLeaseManager` (internal) | KCL lease-coordination *distillation* into a generic library — reference for extraction | mainline |
-| `AmazonKinesisClientLibraryExternalRelease` (internal mirror) | Source of truth for KCL classes below | v2.x / kclv3_prism |
+| [`awslabs/amazon-kinesis-client`](https://github.com/awslabs/amazon-kinesis-client) (KCL) | Lease coordination, shard sync, checkpointing, lifecycle | 3.5.0 |
+| [`awslabs/dynamodb-streams-kinesis-adapter`](https://github.com/awslabs/dynamodb-streams-kinesis-adapter) | DDB-Streams shard detection, data fetch, sleep/catch-up, lease mgmt | 2.3.0 (KCL 3.4.3) |
 
-## DDB adapter classes to mirror (per `.../streamsadapter/`)
+## DDB adapter classes to mirror (`.../streamsadapter/`)
 | Class | What we take from it |
 |---|---|
 | `DynamoDBStreamsShardDetector` | `DescribeStream` pagination → shard list; the `StreamSource.describe_shards` impl |
-| `DynamoDBStreamsShardSyncer` (46KB) | Parent-before-child lease creation; parent-open-child-open inconsistency handling; lineage-replay-safe cleanup |
+| `DynamoDBStreamsShardSyncer` | Parent-before-child lease creation; parent-open-child-open inconsistency handling; lineage-replay-safe cleanup |
 | `DynamoDBStreamsDataFetcher` | `GetShardIterator`/`GetRecords`; `Trimmed`/`ExpiredIterator`/`ResourceNotFound` handling; the `StreamSource.get_records` impl |
 | `DynamoDBStreamsSleepTimeController` + `polling/` | Catch-up polling rate (`catchupEnabled`, `millisBehindLatestThreshold`, `scalingFactor`); recommended `MaxRecords=1000`, `IdleTimeInMillis=500` |
 | `DynamoDBStreamsLeaseManagementFactory` | Lease table wiring specifics for DDB Streams |
-| `StreamsSchedulerFactory` | Config surface (Checkpoint/Coordinator/Lease/Lifecycle/Metrics/Processor/Retrieval); single vs multi-stream tracker; enforces `DynamoDBStreamsShardRecordProcessor` + `DynamoDBStreamsPollingConfig` |
+| `StreamsSchedulerFactory` | Config surface; single vs multi-stream tracker; requires `DynamoDBStreamsShardRecordProcessor` + `DynamoDBStreamsPollingConfig` |
 
-## Robustness behaviors → source mapping
+## KCL classes to mirror (`software.amazon.kinesis.*`)
+| Class | What we take from it |
+|---|---|
+| `HierarchicalShardSyncer` | Child leases created only after parent `SHARD_END`; children initialized at `TRIM_HORIZON`; one-layer lease creation |
+| `ShutdownTask` (`createLeasesForChildShardsIfNotExist`) | Merge child requires BOTH parents present/complete; defer via `BlockedOnParentShardException` on partial lineage, drop-with-1-in-N to let another worker retry |
+| `LeaseCleanupManager` (`cleanupLeaseForCompletedShard`) | Parent lease deleted only after child lease(s) enter PROCESSING (tombstone → prevents lineage replay) |
+| `DynamoDBLeaseTaker` / `DynamoDBLeaseRenewer` / `DynamoDBLeaseCoordinator` | Lease take/steal/renew, optimistic locking on `leaseCounter`, timing model, graceful handoff |
+
+## Robustness behaviors → source
 
 ### Ordering (the imperative requirement)
-- **Parent-before-child**: a child lease is created/processed only after its parent reaches `SHARD_END`. Children initialized at `TRIM_HORIZON` to avoid gaps.
-  - Source: KCL `HierarchicalShardSyncer`; lease lifecycle doc (`CREATION` only when eligible).
-  - Encoded: `Scheduler.eligible()` + `merge_child_waits_for_both_parents` / `parent_before_child_ordering` tests.
-- **Merge child requires BOTH parents**: a shard can have up to two parents; if only one parent lease is present (partial lineage), defer via `BlockedOnParentShardException`, with 1-in-N probability of dropping the lease so another worker retries.
-  - Source: KCL `ShutdownTask.createLeasesForChildShardsIfNotExist`.
-  - Encoded: `ShardMeta.parents: Vec<ShardId>` + `eligible()` requires ALL complete. **TODO:** port the partial-lineage defer/drop policy when we add real shard sync.
+- **Parent-before-child**: child processed only after parent `SHARD_END`; children start at `TRIM_HORIZON`.
+  - Source: `HierarchicalShardSyncer`; KCL lease-lifecycle doc.
+  - Encoded: `Scheduler.eligible()` + `parent_before_child_ordering` test.
+- **Merge child requires BOTH parents**: up to two parents; partial lineage defers.
+  - Source: `ShutdownTask.createLeasesForChildShardsIfNotExist`.
+  - Encoded: `ShardMeta.parents: Vec<ShardId>` + `eligible()` requires ALL complete + `merge_child_waits_for_both_parents` test. **TODO:** port the partial-lineage defer/drop policy.
 - **Per-shard in-sequence delivery + mandatory SHARD_END checkpoint** (unblocks children).
-  - Source: lease lifecycle (`SHARD_END` → `DELETION`); KCL checkpointer.
-  - Encoded: `Scheduler.run()` delivers in seq order, checkpoints per batch, checkpoints at shard end.
+  - Source: KCL checkpointer + lease lifecycle.
+  - Encoded: `Scheduler.run()`.
 
 ### Lease coordination (multi-worker, phase P2+)
-- **Optimistic locking**: all lease mutations conditional on `leaseCounter` match.
-- **Timing model**: renewer at `duration/3 - epsilon` (fixed rate); taker at `(duration + epsilon) * 2` (fixed delay).
-- **Take order**: expired-first, then steal from most-loaded; **very-old leases** (> `3 * leaseDuration`) taken first; **stale-scan re-fetch** if a scan took > `renewerInterval * 0.5`.
-- **Spurious-failure recovery**: on conditional-write failure, re-read the lease to detect a successful-but-reported-failed write.
-- **Graceful handoff** (KCL 3.x): `checkpointOwner`/handoff-target protocol lets the current owner finish before transfer.
-  - Source: KCL `DynamoDBLeaseTaker` / `DynamoDBLeaseRenewer` / `DynamoDBLeaseCoordinator`; distilled in `AWSBifrostLeaseManager` (`plan/03-DISTILLATION-MAP.md`, `references/kcl-distillation-deepdive.md`).
+- Optimistic locking on `leaseCounter`; renewer at `duration/3 - epsilon`, taker at `(duration + epsilon) * 2`; expired-first then steal-from-most-loaded; very-old (> `3 * leaseDuration`) taken first; spurious-failure re-read; graceful handoff (KCL 3.x).
+  - Source: `DynamoDBLeaseTaker` / `DynamoDBLeaseRenewer` / `DynamoDBLeaseCoordinator`.
 
 ### Lineage-replay safety
-- **Parent lease deleted only after child lease(s) enter PROCESSING** (tombstone → prevents replay of a completed shard's lineage).
-  - Source: KCL `LeaseCleanupManager.cleanupLeaseForCompletedShard`.
-  - **TODO:** encode ordering constraint in the `LeaseStore` cleanup contract.
+- Parent lease deleted only after child lease(s) enter PROCESSING.
+  - Source: `LeaseCleanupManager.cleanupLeaseForCompletedShard`. **TODO:** encode in `LeaseStore` cleanup contract.
 
 ### Bootstrap & shard sync at scale
-- **Empty lease table bootstrap** uses `ShardFilter` (`AT_TRIM_HORIZON` / `AT_LATEST` / `AT_TIMESTAMP`) to create leases only for a snapshot of open shards.
-- **Incremental sync** thereafter driven by `ChildShards` in `GetRecords` responses (avoids full re-enumeration); leader-only `PeriodicShardSyncManager`.
-  - Source: KCL 2.3.0+ changelog; `PeriodicShardSyncManager`.
-  - Edge case to guard: paginated shard enumeration can produce an **incomplete hash range** when the trim horizon advances mid-pagination (observed at 130K shards) — retry/validate hash-range completeness.
+- Empty lease table bootstrap uses `ShardFilter` (`AT_TRIM_HORIZON`/`AT_LATEST`/`AT_TIMESTAMP`) for a snapshot of open shards; incremental sync thereafter via `ChildShards` in `GetRecords` responses; leader-only `PeriodicShardSyncManager`.
+  - Source: KCL 2.3.0+ CHANGELOG; `PeriodicShardSyncManager`.
+  - Guard: paginated shard enumeration can yield an incomplete hash range if trim horizon advances mid-pagination — validate/retry.
 
 ### DDB Streams specifics
-- ~4-hour virtual shard rollover → frequent `SHARD_END` + child creation.
-- 24h retention; polling only (no enhanced fan-out).
-- `TrimmedDataAccessException` / `ExpiredIteratorException` / `ResourceNotFoundException` → restart shard at `TRIM_HORIZON`.
-  - Source: `DynamoDBStreamsDataFetcher`; DDB Streams KCL runbook.
+- ~4-hour virtual shard rollover → frequent `SHARD_END` + child creation; 24h retention; polling only (no EFO); `Trimmed`/`ExpiredIterator`/`ResourceNotFound` → restart shard at `TRIM_HORIZON`.
+  - Source: `DynamoDBStreamsDataFetcher`; KCL Adapter docs.
 
-## Operational anti-patterns to avoid (from internal KCL patterns)
-1. Use child **processes**, not threads, per partition (crash isolation) — matches our daemon+IPC design.
+## Operational anti-patterns to avoid (industry/KCL guidance)
+1. Child **processes** not threads per partition (crash isolation) — matches our daemon+IPC design.
 2. Stable lease-owner id (`taskARN:pid` / `podName` / `instanceId:pid`), never hostname.
 3. Lease TTL ≥ 10s (15–30s for containers); never shorter than GC/throttle pauses.
-4. Always use fencing tokens; never let a zombie holder write after lease loss.
+4. Always use fencing tokens; no zombie writes after lease loss.
 5. SIGTERM handlers to release leases promptly.
-6. Auto-scaling cooldown ≥ lease duration (avoid oscillation).
+6. Auto-scaling cooldown ≥ lease duration.
 
 ## Provenance
-Sourced 2026-07-01 from the awslabs public repos and internal mirrors listed above.
-Line-anchored KCL refs (subject to drift): `LeaseCleanupManager.java#L263-L294`,
-`LeaseManagementConfig.java#L112-L128` (lease-cleanup config).
+Sourced 2026-07-01 from the public awslabs Apache-2.0 repositories listed above.
