@@ -12,8 +12,11 @@
 //! testable with zero network. The real DDB Streams / DynamoDB adapters are
 //! added as implementors of these traits.
 
-pub type ShardId = String;
+pub mod taker;
+pub mod coordinator;
+pub mod cleanup;
 
+pub type ShardId = String;
 /// DynamoDB Streams sequence number. This is an **opaque, monotonically
 /// increasing token** (a stringified 128-bit integer) — NOT something to
 /// compare or parse. The engine only ever stores the last-seen value as a

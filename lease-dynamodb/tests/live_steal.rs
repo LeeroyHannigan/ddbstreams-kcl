@@ -12,8 +12,8 @@
 //!     --features aws --test live_steal -- --nocapture
 
 use aws_sdk_dynamodb as ddb;
+use ddbstreams_kcl_core::taker::{compute_leases_to_take, LeaseSnapshot};
 use ddbstreams_kcl_lease_dynamodb::dynamodb::{DynamoDbLeaseStore, LeaseError};
-use ddbstreams_kcl_lease_dynamodb::taker::{compute_leases_to_take, LeaseSnapshot};
 
 #[tokio::test]
 async fn live_worker_steals_expired_leases() {

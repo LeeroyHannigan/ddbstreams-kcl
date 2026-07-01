@@ -5,7 +5,7 @@
 //! shard's lineage to be rediscovered and replayed. This mirrors KCL
 //! `LeaseCleanupManager.cleanupLeaseForCompletedShard`. See core/REFERENCES.md.
 
-use ddbstreams_kcl_core::ShardMeta;
+use crate::ShardMeta;
 use std::collections::HashMap;
 
 /// Lease state relevant to cleanup.
