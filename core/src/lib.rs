@@ -305,4 +305,52 @@ mod tests {
         assert!(pos("rec:p-a:1") < pos("rec:p-a:2") && pos("rec:p-a:2") < end_a);
         assert!(pos("rec:p-b:3") < pos("rec:p-b:4") && pos("rec:p-b:4") < end_b);
     }
+
+    /// Deep reshard storm: g0 -> g1 -> g2 (split, then the child splits again).
+    /// Strict ancestor-before-descendant ordering across multiple levels.
+    #[test]
+    fn reshard_storm_multilevel_ordering() {
+        let mut data = HashMap::new();
+        data.insert("g0".to_string(), vec![rec("g0", 1)]);
+        data.insert("g1".to_string(), vec![rec("g1", 2)]);
+        data.insert("g2".to_string(), vec![rec("g2", 3)]);
+        let source = InMemSource {
+            // listed leaf-first to prove ordering is by lineage, not list order.
+            metas: vec![
+                ShardMeta { id: "g2".into(), parents: vec!["g1".into()] },
+                ShardMeta { id: "g1".into(), parents: vec!["g0".into()] },
+                ShardMeta { id: "g0".into(), parents: vec![] },
+            ],
+            data,
+        };
+        let mut proc = RecordingProcessor::default();
+        let mut sched = Scheduler::new(source, InMemLeases::default());
+        sched.run(&mut proc);
+        assert_eq!(
+            proc.events,
+            vec![
+                "init:g0", "rec:g0:1", "end:g0",
+                "init:g1", "rec:g1:2", "end:g1",
+                "init:g2", "rec:g2:3", "end:g2",
+            ]
+        );
+    }
+
+    /// On restart with an existing checkpoint, only records AFTER the checkpoint
+    /// are delivered (resume-from-checkpoint semantics).
+    #[test]
+    fn resumes_after_checkpoint() {
+        let mut data = HashMap::new();
+        data.insert("s".to_string(), vec![rec("s", 10), rec("s", 11), rec("s", 12)]);
+        let source = InMemSource {
+            metas: vec![ShardMeta { id: "s".into(), parents: vec![] }],
+            data,
+        };
+        let mut leases = InMemLeases::default();
+        leases.checkpoint(&"s".to_string(), 11); // records <= 11 already processed
+        let mut proc = RecordingProcessor::default();
+        let mut sched = Scheduler::new(source, leases);
+        sched.run(&mut proc);
+        assert_eq!(proc.events, vec!["init:s", "rec:s:12", "end:s"]);
+    }
 }
