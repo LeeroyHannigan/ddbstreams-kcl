@@ -63,6 +63,9 @@ source for reviewers to verify fidelity.
 
 ### DDB Streams specifics
 - ~4-hour virtual shard rollover → frequent `SHARD_END` + child creation; 24h retention; polling only (no EFO); `Trimmed`/`ExpiredIterator`/`ResourceNotFound` → restart shard at `TRIM_HORIZON`.
+- **parent-open-child-open inconsistency**: DDB Streams may report a parent as open while it already has children. A parent referenced by a present shard must have ended → mark it closed, else the parent-before-child gate blocks its children forever.
+  - Source: `DynamoDBStreamsShardDetector.describeStream` Phase 2 / `ShardGraphTracker.closeOpenParents`.
+  - Encoded: `close_open_parents()` (source-ddbstreams).
   - Source: `DynamoDBStreamsDataFetcher`; KCL Adapter docs.
 
 ## Operational anti-patterns to avoid (industry/KCL guidance)

@@ -160,6 +160,36 @@ fn parents_of(s: &DdbShard, present: &HashSet<&ShardId>) -> Vec<ShardId> {
     }
 }
 
+/// Sentinel ending sequence number stamped on a parent shard that appeared open
+/// but has children (see [`close_open_parents`]). Any non-`None` value marks the
+/// shard closed for [`DdbShard::is_open`]; the exact value is not a real DDB
+/// sequence number and must not be used for iteration.
+pub const CLOSED_BY_SHARD_SYNC: &str = "__closed_by_shard_sync__";
+
+/// Close "open" parents (adapter shard-sync Phase 2 / `ShardGraphTracker`).
+///
+/// DynamoDB Streams can transiently report a parent shard as open (no ending
+/// sequence number) even though it already has child shards — the
+/// "parent-open-child-open" inconsistency. Left as-is, such a parent never
+/// reaches `SHARD_END`, so the engine's parent-before-child gate would block its
+/// children indefinitely. Any shard that is referenced as a parent by a present
+/// shard MUST have already ended, so we mark it closed.
+///
+/// Grounded in `DynamoDBStreamsShardDetector.describeStream` Phase 2
+/// (`ShardGraphTracker.closeOpenParents`) — awslabs/dynamodb-streams-kinesis-adapter.
+pub fn close_open_parents(mut shards: Vec<DdbShard>) -> Vec<DdbShard> {
+    let parent_ids: HashSet<ShardId> = shards
+        .iter()
+        .filter_map(|s| s.parent_shard_id.clone())
+        .collect();
+    for s in &mut shards {
+        if s.is_open() && parent_ids.contains(&s.shard_id) {
+            s.ending_sequence_number = Some(CLOSED_BY_SHARD_SYNC.to_string());
+        }
+    }
+    shards
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +278,32 @@ mod tests {
             ids_with_parents(&g),
             vec![("p", vec![]), ("c1", vec!["p"]), ("c2", vec!["p"])]
         );
+    }
+
+    #[test]
+    fn close_open_parents_closes_a_parent_that_looks_open() {
+        // "p" is reported open (no ending seq) but has a child "c" → must close.
+        let shards = vec![
+            DdbShard::new("p", None),          // open, but is a parent
+            DdbShard::new("c", Some("p")),     // leaf, genuinely open
+        ];
+        let out = close_open_parents(shards);
+        let p = out.iter().find(|s| s.shard_id == "p").unwrap();
+        let c = out.iter().find(|s| s.shard_id == "c").unwrap();
+        assert!(!p.is_open(), "parent with children must be closed");
+        assert_eq!(p.ending_sequence_number.as_deref(), Some(CLOSED_BY_SHARD_SYNC));
+        assert!(c.is_open(), "childless leaf stays open");
+    }
+
+    #[test]
+    fn close_open_parents_leaves_already_closed_parents_untouched() {
+        let shards = vec![
+            DdbShard::closed("p", None, "seq-real"),
+            DdbShard::new("c", Some("p")),
+        ];
+        let out = close_open_parents(shards);
+        let p = out.iter().find(|s| s.shard_id == "p").unwrap();
+        // Real ending sequence number preserved (not overwritten by the sentinel).
+        assert_eq!(p.ending_sequence_number.as_deref(), Some("seq-real"));
     }
 }
