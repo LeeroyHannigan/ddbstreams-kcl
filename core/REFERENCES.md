@@ -52,7 +52,8 @@ source for reviewers to verify fidelity.
 
 ### Lineage-replay safety
 - Parent lease deleted only after child lease(s) enter PROCESSING.
-  - Source: `LeaseCleanupManager.cleanupLeaseForCompletedShard`. **TODO:** encode in `LeaseStore` cleanup contract.
+  - Source: `LeaseCleanupManager.cleanupLeaseForCompletedShard`.
+  - Encoded: `cleanup::leases_safe_to_delete()` (lease-dynamodb) — a completed parent is deletable only once all its children have present, processing/completed leases.
 
 ### Bootstrap & shard sync at scale
 - Empty lease table bootstrap creates leases for a snapshot of open shards; incremental sync thereafter via `ChildShards` in `GetRecords` responses; leader-only `PeriodicShardSyncManager`.

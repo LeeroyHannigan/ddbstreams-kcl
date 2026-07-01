@@ -51,6 +51,7 @@ pub mod dynamodb;
 
 pub mod taker;
 pub mod coordinator;
+pub mod cleanup;
 
 #[cfg(test)]
 mod tests {
