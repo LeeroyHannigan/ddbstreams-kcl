@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy (aws feature)
+        run: cargo clippy --workspace --all-targets --features aws -- -D warnings
+      # Unit + offline integration tests. Live tests are gated on
+      # DDB_STREAMS_CONSUMER_IT and skip themselves without it, so CI needs no
+      # AWS credentials.
+      - name: Test
+        run: cargo test --workspace
+
+  python:
+    name: Python client
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.8", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Unit tests
+        working-directory: clients/python
+        run: python -m unittest discover -s tests
+
+  coverage:
+    name: Coverage (offline)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      # Offline coverage summary. Live AWS paths (only reached under
+      # DDB_STREAMS_CONSUMER_IT with credentials) are excluded here.
+      - name: Coverage summary
+        run: cargo llvm-cov --workspace --summary-only
