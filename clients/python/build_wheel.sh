@@ -12,19 +12,25 @@ root="$(cd "$here/../.." && pwd)"
 bin_name="amazon-dynamodb-streams-consumer-sidecar"
 target="${1:-}"
 
+# Windows binaries carry a .exe suffix.
+ext=""
+case "${OSTYPE:-}" in
+  msys* | cygwin* | win*) ext=".exe" ;;
+esac
+
 if [ -n "$target" ]; then
   (cd "$root" && cargo build --release -p "$bin_name" --target "$target")
-  built="$root/target/$target/release/$bin_name"
+  built="$root/target/$target/release/${bin_name}${ext}"
 else
   (cd "$root" && cargo build --release -p "$bin_name")
-  built="$root/target/release/$bin_name"
+  built="$root/target/release/${bin_name}${ext}"
 fi
 
 dest="$here/src/dynamodb_streams_consumer/_bin"
 mkdir -p "$dest"
-cp "$built" "$dest/$bin_name"
-chmod +x "$dest/$bin_name"
-echo "bundled: $dest/$bin_name"
+cp "$built" "$dest/${bin_name}${ext}"
+chmod +x "$dest/${bin_name}${ext}" 2>/dev/null || true
+echo "bundled: $dest/${bin_name}${ext}"
 
 python -m build --wheel "$here"
 echo "wheel(s):"
