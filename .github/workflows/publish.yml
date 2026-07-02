@@ -1,0 +1,81 @@
+name: Publish (TestPyPI)
+
+# Exercises the real publish pipeline against TestPyPI: builds PyPI-valid wheels
+# (manylinux on Linux, native on macOS) with the sidecar bundled, plus an sdist,
+# and publishes via OIDC trusted publishing (no stored token).
+#
+# Trigger on a tag, or manually (workflow_dispatch) for a dry test run.
+# Switching to real PyPI later = drop the `repository-url` line and register the
+# trusted publisher on pypi.org instead (ideally from the authoritative repo).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  linux-wheel:
+    name: Wheel (manylinux x86_64)
+    runs-on: ubuntu-latest
+    # Build inside the manylinux image so the sidecar links an old-enough glibc
+    # and the wheel can legitimately carry a manylinux tag (PyPI-acceptable).
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build bundled wheel + relabel manylinux
+        run: |
+          set -euo pipefail
+          PYBIN=/opt/python/cp311-cp311/bin
+          "$PYBIN/pip" install --upgrade build wheel
+          PATH="$HOME/.cargo/bin:$PYBIN:$PATH" bash clients/python/build_wheel.sh
+          # build_wheel.sh tags the wheel linux_x86_64; relabel to manylinux
+          # (valid because it was built against manylinux_2_28's glibc).
+          "$PYBIN/python" -m wheel tags --platform-tag manylinux_2_28_x86_64 --remove clients/python/dist/*.whl
+          ls -1 clients/python/dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-x86_64
+          path: clients/python/dist/*.whl
+
+  macos-wheel:
+    name: Wheel (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-13] # arm64, x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      - run: python -m pip install --upgrade build wheel
+      - run: bash clients/python/build_wheel.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}
+          path: clients/python/dist/*.whl
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: [linux-wheel, macos-wheel]
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write # OIDC trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist
