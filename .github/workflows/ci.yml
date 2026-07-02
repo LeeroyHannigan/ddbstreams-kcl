@@ -88,6 +88,7 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         id: aws
         if: steps.awscfg.outputs.enabled == 'true'
+        continue-on-error: true # if the role isn't set up yet, fall back to offline coverage
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
