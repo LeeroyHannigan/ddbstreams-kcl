@@ -51,10 +51,21 @@ that speaks the protocol — there is no JVM and no per-language reimplementatio
 
 ## Getting started (Python)
 
-> **Alpha — not yet published to PyPI.** Install a prebuilt wheel from the
-> [GitHub Releases](https://github.com/LeeroyHannigan/amazon-dynamodb-streams-consumer/releases)
-> page, or build one locally (see [Building and testing](#building-and-testing)).
-> PyPI publishing is planned.
+> **Alpha — published to [TestPyPI](https://test.pypi.org/project/amazon-dynamodb-streams-consumer/), not yet on PyPI.**
+> Prebuilt wheels (with the native sidecar bundled) are available for Linux
+> (x86_64, aarch64), macOS (arm64, x86_64), and Windows x86_64.
+
+Install from TestPyPI:
+
+```
+pip install -i https://test.pypi.org/simple/ amazon-dynamodb-streams-consumer
+```
+
+> The package has no runtime dependencies, so no extra index is required. If a
+> wheel is not available for your platform, install fails (there is no source
+> fallback — the sidecar is a prebuilt binary). You can also build a wheel
+> locally (see [Building and testing](#building-and-testing)). Release to the
+> real PyPI is planned once the project reaches its authoritative home.
 
 ```python
 from dynamodb_streams_consumer import Worker
