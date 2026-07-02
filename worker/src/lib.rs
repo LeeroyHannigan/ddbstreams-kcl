@@ -70,6 +70,9 @@ pub trait AsyncLeaseStore {
         owner: &str,
         counter: u64,
     ) -> Result<(), WorkerError>;
+    /// Release a held lease (clear owner, bump counter) so another worker can
+    /// take it immediately on graceful shutdown. Conditional on ownership.
+    async fn release(&self, lease_key: &str, owner: &str, counter: u64) -> Result<(), WorkerError>;
 }
 
 /// Async, ack-gated per-shard delivery used by the [`fleet::Fleet`]. Unlike the
@@ -322,6 +325,13 @@ mod tests {
         }
         async fn mark_complete(&self, key: &str, _owner: &str, _counter: u64) -> Result<(), WorkerError> {
             self.rows.lock().unwrap().get_mut(key).ok_or("no lease")?.completed = true;
+            Ok(())
+        }
+        async fn release(&self, key: &str, _owner: &str, counter: u64) -> Result<(), WorkerError> {
+            let mut rows = self.rows.lock().unwrap();
+            let r = rows.get_mut(key).ok_or("no lease")?;
+            r.owner = None;
+            r.counter = counter + 1;
             Ok(())
         }
     }

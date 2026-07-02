@@ -57,4 +57,7 @@ impl AsyncLeaseStore for DynamoDbLeaseStore {
     async fn mark_complete(&self, key: &str, owner: &str, counter: u64) -> Result<(), WorkerError> {
         DynamoDbLeaseStore::mark_complete(self, key, owner, counter).await.map_err(box_lease)
     }
+    async fn release(&self, key: &str, owner: &str, counter: u64) -> Result<(), WorkerError> {
+        DynamoDbLeaseStore::release(self, key, owner, counter).await.map_err(box_lease)
+    }
 }

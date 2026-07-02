@@ -131,6 +131,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
+    // Graceful shutdown: release our leases so another worker takes over
+    // immediately instead of waiting for expiry.
+    match fleet.release_owned().await {
+        Ok(n) => eprintln!("[sidecar] released {n} lease(s)"),
+        Err(e) => eprintln!("[sidecar] lease release error: {e}"),
+    }
     ipc.shutdown("sidecar stopping").await;
     eprintln!("[sidecar] stopped");
     Ok(())

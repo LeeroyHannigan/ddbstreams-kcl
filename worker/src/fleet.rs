@@ -133,6 +133,24 @@ where
         while set.join_next().await.is_some() {}
         Ok(false)
     }
+
+    /// Release every lease this worker currently owns (graceful shutdown), so
+    /// another worker takes over immediately rather than waiting for expiry.
+    /// Best-effort per lease: a lease already stolen is skipped. Returns the
+    /// count released.
+    pub async fn release_owned(&self) -> Result<usize, WorkerError> {
+        let rows = self.leases.list().await?;
+        let owner = self.config.owner.as_str();
+        let mut released = 0;
+        for r in rows {
+            if r.owner.as_deref() == Some(owner) && !r.completed
+                && self.leases.release(&r.lease_key, owner, r.lease_counter).await.is_ok()
+            {
+                released += 1;
+            }
+        }
+        Ok(released)
+    }
 }
 
 /// Per-shard task parameters (kept in one struct so the spawn signature stays
@@ -286,6 +304,13 @@ mod tests {
         }
         async fn mark_complete(&self, key: &str, _o: &str, _c: u64) -> Result<(), WorkerError> {
             self.rows.lock().unwrap().get_mut(key).ok_or("no lease")?.completed = true;
+            Ok(())
+        }
+        async fn release(&self, key: &str, _o: &str, counter: u64) -> Result<(), WorkerError> {
+            let mut rows = self.rows.lock().unwrap();
+            let r = rows.get_mut(key).ok_or("no lease")?;
+            r.owner = None;
+            r.counter = counter + 1;
             Ok(())
         }
     }
@@ -471,5 +496,33 @@ mod tests {
             9,
             "3 records re-delivered across 3 cycles (checkpoint never advanced)"
         );
+    }
+
+    #[tokio::test]
+    async fn release_owned_clears_our_leases_for_fast_failover() {
+        let source = FakeSource { metas: vec![], data: HashMap::new() };
+        let leases = FakeLeases::default();
+        {
+            let mut rows = leases.rows.lock().unwrap();
+            rows.insert("mine".into(), State { owner: Some("w1".into()), counter: 3, completed: false, checkpoint: None });
+            rows.insert("theirs".into(), State { owner: Some("w2".into()), counter: 1, completed: false, checkpoint: None });
+            rows.insert("done".into(), State { owner: Some("w1".into()), counter: 5, completed: true, checkpoint: None });
+        }
+        let sink: Sink = Arc::new(Mutex::new(HashMap::new()));
+        let fleet = Fleet::new(
+            source,
+            leases,
+            Arc::new(SyncConsumerFactory::new(Arc::new(RecordingFactory { sink }))),
+            FleetConfig { owner: "w1".into(), max_leases: 100, lease_duration_ms: 1000, poll_interval_ms: 1 },
+        );
+
+        let released = fleet.release_owned().await.unwrap();
+        assert_eq!(released, 1, "only our own, non-completed lease is released");
+
+        let rows = fleet.leases.rows.lock().unwrap();
+        assert!(rows["mine"].owner.is_none(), "our lease is now unowned");
+        assert_eq!(rows["mine"].counter, 4, "counter bumped under the optimistic lock");
+        assert_eq!(rows["theirs"].owner.as_deref(), Some("w2"), "another worker's lease untouched");
+        assert!(rows["done"].owner.is_some(), "a completed lease is not released");
     }
 }

@@ -255,6 +255,29 @@ impl DynamoDbLeaseStore {
             Err(e) => Err(classify(e)),
         }
     }
+
+    /// Release a lease we hold: clear the owner and bump the counter, conditioned
+    /// on ownership. Lets another worker take it over **immediately** on graceful
+    /// shutdown instead of waiting for the lease to expire (KCL evicts on
+    /// shutdown). A `LeaseError::Lost` means it was already stolen — harmless.
+    pub async fn release(&self, lease_key: &str, owner: &str, counter: u64) -> Result<(), LeaseError> {
+        let r = self
+            .client
+            .update_item()
+            .table_name(&self.table)
+            .key(LEASE_KEY, AttributeValue::S(lease_key.to_string()))
+            .update_expression("REMOVE leaseOwner SET leaseCounter = leaseCounter + :one")
+            .condition_expression("leaseCounter = :c AND leaseOwner = :o")
+            .expression_attribute_values(":one", AttributeValue::N("1".into()))
+            .expression_attribute_values(":c", AttributeValue::N(counter.to_string()))
+            .expression_attribute_values(":o", AttributeValue::S(owner.to_string()))
+            .send()
+            .await;
+        match r {
+            Ok(_) => Ok(()),
+            Err(e) => Err(classify(e)),
+        }
+    }
 }
 
 fn classify<E>(e: E) -> LeaseError
