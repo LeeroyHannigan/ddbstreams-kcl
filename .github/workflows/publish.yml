@@ -44,24 +44,38 @@ jobs:
           path: clients/python/dist/*.whl
 
   macos-wheel:
-    name: Wheel (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, macos-13] # arm64, x86_64
-    runs-on: ${{ matrix.os }}
+    name: Wheel (macOS arm64 + x86_64)
+    # Both wheels build on the arm64 runner; x86_64 is cross-compiled. The Intel
+    # macos-13 image is deprecated and its runner pool is starved, so we no
+    # longer depend on it.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
       - uses: actions/setup-python@v6
         with:
           python-version: "3.x"
       - run: python -m pip install --upgrade build wheel
-      - run: bash clients/python/build_wheel.sh
+      - name: Build arm64 wheel (native)
+        run: |
+          set -euo pipefail
+          bash clients/python/build_wheel.sh
+          mkdir -p staged
+          mv clients/python/dist/*.whl staged/
+      - name: Build x86_64 wheel (cross-compiled, relabeled)
+        run: |
+          set -euo pipefail
+          bash clients/python/build_wheel.sh x86_64-apple-darwin
+          python -m wheel tags --platform-tag macosx_11_0_x86_64 --remove clients/python/dist/*.whl
+          mv clients/python/dist/*.whl staged/
+      - name: List wheels
+        run: ls -1 staged/
       - uses: actions/upload-artifact@v4
         with:
-          name: wheel-${{ matrix.os }}
-          path: clients/python/dist/*.whl
+          name: wheel-macos
+          path: staged/*.whl
 
   linux-wheel-aarch64:
     name: Wheel (manylinux aarch64)
