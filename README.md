@@ -110,8 +110,8 @@ shutdown) and another picks them up, resuming from the last checkpoint.
 | Component | What it is |
 |---|---|
 | `amazon-dynamodb-streams-consumer-core` | Pure ordering/lease/checkpoint engine + typed record model (no AWS, no network). |
-| `…-source-ddbstreams` | DynamoDB Streams shard-graph logic + async reader over `aws-sdk-dynamodbstreams`. |
-| `…-lease-dynamodb` | Optimistic-lock lease store on DynamoDB (acquire/renew/checkpoint/steal/release). |
+| `…-source` | DynamoDB Streams shard-graph logic + async reader over `aws-sdk-dynamodbstreams`. |
+| `…-lease` | Optimistic-lock lease store on DynamoDB (acquire/renew/checkpoint/steal/release). |
 | `…-worker` | The `Fleet` runtime: per-shard concurrent tasks, coordination, shard-sync, checkpoint resume. |
 | `…-protocol` | JSON-Lines wire protocol shared by the sidecar and language clients. |
 | `…-sidecar` | The consumer binary a language client spawns and talks to over stdio. |
