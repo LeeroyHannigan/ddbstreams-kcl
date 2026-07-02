@@ -49,26 +49,38 @@ jobs:
           tar: unix
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  python-dist:
-    name: Python distribution
+  python-wheels:
+    name: Python wheel (${{ matrix.os }})
     needs: create-release
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, macos-13] # linux x86_64, macOS arm64, macOS x86_64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v6
         with:
           python-version: "3.x"
-      - name: Build sdist and wheel
-        working-directory: clients/python
-        run: |
-          python -m pip install --upgrade build
-          python -m build
+      - run: python -m pip install --upgrade build
+      # Compiles the sidecar for this host and bundles it into a platform wheel.
+      - name: Build platform wheel (bundled sidecar)
+        run: bash clients/python/build_wheel.sh
+      # The sdist is platform-independent; build it once.
+      - name: Build sdist
+        if: matrix.os == 'ubuntu-latest'
+        run: python -m build --sdist clients/python
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
           files: clients/python/dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # NOTE: linux wheels are tagged linux_x86_64 here; for PyPI they must be
+  # repaired to manylinux (auditwheel) and linux aarch64 added via an ARM runner
+  # or cross-build. Deferred until registry publishing is enabled.
 
   # --- Registry publishing (disabled until 1.0 / accounts configured) ----------
   # When ready to publish to public registries, enable these. Both support OIDC

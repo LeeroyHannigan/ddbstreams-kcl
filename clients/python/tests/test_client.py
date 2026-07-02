@@ -133,11 +133,14 @@ class TestWorkerEdgeCases(unittest.TestCase):
 
         saved = _os.environ.pop("DDB_STREAMS_CONSUMER_SIDECAR", None)
         saved_path = _os.environ.get("PATH")
+        saved_bundled = worker_mod._bundled_sidecar
         try:
             _os.environ["PATH"] = ""  # nothing discoverable
+            worker_mod._bundled_sidecar = lambda: None  # and no bundled binary
             with self.assertRaises(FileNotFoundError):
                 worker_mod._discover_sidecar()
         finally:
+            worker_mod._bundled_sidecar = saved_bundled
             if saved is not None:
                 _os.environ["DDB_STREAMS_CONSUMER_SIDECAR"] = saved
             if saved_path is not None:

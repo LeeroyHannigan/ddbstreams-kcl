@@ -45,10 +45,13 @@ native Python (`S`→str, `N`→str to stay lossless, `Bool`→bool, `Null`→No
 
 ## The sidecar binary
 
-The library needs the `amazon-dynamodb-streams-consumer-sidecar` binary. Resolution order:
+The library needs the `amazon-dynamodb-streams-consumer-sidecar` binary. **When
+installed from a released wheel, the binary is bundled inside the package** and
+used automatically — no setup required. Resolution order:
 1. `sidecar_path=...` argument
 2. `DDB_STREAMS_CONSUMER_SIDECAR` environment variable
-3. `amazon-dynamodb-streams-consumer-sidecar` on `PATH`
+3. the binary **bundled in the installed wheel** (`dynamodb_streams_consumer/_bin/`)
+4. `amazon-dynamodb-streams-consumer-sidecar` on `PATH`
 
 AWS credentials and region are picked up by the sidecar from the standard AWS
 environment (same as any AWS SDK).

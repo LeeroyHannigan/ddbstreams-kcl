@@ -41,10 +41,24 @@ class RecordProcessor(Protocol):
     def process_records(self, records: List[Record]) -> None: ...
 
 
+def _bundled_sidecar() -> Optional[str]:
+    """The sidecar binary shipped inside the installed (platform) wheel, if any."""
+    bin_dir = os.path.join(os.path.dirname(__file__), "_bin")
+    for name in (DEFAULT_BINARY, DEFAULT_BINARY + ".exe"):
+        path = os.path.join(bin_dir, name)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
 def _discover_sidecar() -> str:
+    # 1) explicit override, 2) bundled binary from the wheel, 3) PATH.
     env = os.environ.get("DDB_STREAMS_CONSUMER_SIDECAR")
     if env:
         return env
+    bundled = _bundled_sidecar()
+    if bundled:
+        return bundled
     found = shutil.which(DEFAULT_BINARY)
     if found:
         return found

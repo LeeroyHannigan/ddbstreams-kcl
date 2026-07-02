@@ -1,0 +1,7 @@
+# Generated packaging artifacts
+/dist/
+/build/
+*.egg-info/
+# Sidecar binary is bundled at build time, not committed
+/src/dynamodb_streams_consumer/_bin/
+__pycache__/
