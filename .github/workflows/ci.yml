@@ -51,8 +51,11 @@ jobs:
         run: python -m unittest discover -s tests
 
   coverage:
-    name: Coverage (offline)
+    name: Coverage
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC for AWS (live integration tests); unused if not configured
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -60,7 +63,48 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
-      # Offline coverage summary. Live AWS paths (only reached under
-      # DDB_STREAMS_CONSUMER_IT with credentials) are excluded here.
-      - name: Coverage summary
-        run: cargo llvm-cov --workspace --summary-only
+
+      # Live integration tests require AWS. They run only when a role is
+      # configured (repo variable AWS_ROLE_ARN) AND this is not a fork PR — forks
+      # receive neither an OIDC token nor secrets. Otherwise coverage runs
+      # offline (the AWS-adapter files then report low coverage, which is
+      # expected).
+      - name: Configure AWS credentials (OIDC)
+        id: aws
+        if: >-
+          ${{ vars.AWS_ROLE_ARN != ''
+          && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Run coverage
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.aws.outcome }}" = "success" ]; then
+            echo "Running WITH live integration tests"
+            DDB_STREAMS_CONSUMER_IT=1 cargo llvm-cov --no-report --workspace --features aws
+          else
+            echo "Running offline (no AWS credentials configured)"
+            cargo llvm-cov --no-report --workspace
+          fi
+          cargo llvm-cov report --lcov --output-path lcov.info
+          {
+            echo '### Coverage'
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Posts a PR comment with total + diff (changed-lines) coverage and a
+      # status check, once the repository is enabled on codecov.io. Free for
+      # public repositories.
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+

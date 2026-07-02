@@ -1,0 +1,22 @@
+# Codecov configuration. Coverage is reported on every PR (total + diff) but is
+# informational (non-blocking) while the project is pre-1.0.
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+        informational: true
+    patch:
+      default:
+        target: 80%
+        informational: true
+
+comment:
+  layout: "reach, diff, flags, files"
+  behavior: default
+  require_changes: false
+
+# The AWS-adapter files are exercised only by live integration tests, which do
+# not run on fork PRs (no credentials). Their coverage will read low on such
+# runs; that is expected and non-blocking.

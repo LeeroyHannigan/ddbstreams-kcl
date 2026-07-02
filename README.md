@@ -15,6 +15,7 @@ implement a record processor; the library handles the rest.
 
 [![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![codecov](https://codecov.io/gh/LeeroyHannigan/amazon-dynamodb-streams-consumer/branch/main/graph/badge.svg)](https://codecov.io/gh/LeeroyHannigan/amazon-dynamodb-streams-consumer)
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
 
 ## Status
