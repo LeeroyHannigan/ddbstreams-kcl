@@ -51,9 +51,10 @@ that speaks the protocol — there is no JVM and no per-language reimplementatio
 
 ## Getting started (Python)
 
-```
-pip install amazon-dynamodb-streams-consumer
-```
+> **Alpha — not yet published to PyPI.** Install a prebuilt wheel from the
+> [GitHub Releases](https://github.com/LeeroyHannigan/amazon-dynamodb-streams-consumer/releases)
+> page, or build one locally (see [Building and testing](#building-and-testing)).
+> PyPI publishing is planned.
 
 ```python
 from dynamodb_streams_consumer import Worker
@@ -130,6 +131,10 @@ DDB_STREAMS_CONSUMER_IT=1 AWS_REGION=us-east-1 cargo test --workspace --features
 
 # Python client tests
 cd clients/python && python3 -m unittest discover -s tests
+
+# Build a Python wheel with the sidecar bundled (installs a working consumer)
+bash clients/python/build_wheel.sh
+pip install clients/python/dist/*.whl
 ```
 
 ## License
