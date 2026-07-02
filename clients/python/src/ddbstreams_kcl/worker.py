@@ -1,0 +1,197 @@
+"""The customer-facing entry point: spawn the ddbstreams-kcl sidecar and deliver
+ordered, checkpointed change records to a processor.
+
+Example::
+
+    from ddbstreams_kcl import Worker
+
+    class MyProcessor:
+        def process_records(self, records):
+            for r in records:
+                print(r.event_name, r.keys, r.new_image)
+        # optional:
+        def shard_ended(self, shard_id): ...
+
+    Worker(
+        stream_arn="arn:aws:dynamodb:...:table/Orders/stream/2026-...",
+        lease_table="my-app-leases",
+        processor=MyProcessor(),
+    ).run()
+
+The sidecar owns all coordination (shard discovery, leases, ordering,
+checkpoints). This client is a thin stdio bridge: it reads record batches, calls
+``processor.process_records(records)``, and acks each batch so the sidecar
+advances the checkpoint (at-least-once)."""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import threading
+from typing import List, Optional, Protocol, Sequence
+
+from .record import Record
+
+DEFAULT_BINARY = "ddbstreams-kcl-sidecar"
+
+
+class RecordProcessor(Protocol):
+    def process_records(self, records: List[Record]) -> None: ...
+
+
+def _discover_sidecar() -> str:
+    env = os.environ.get("DDBSTREAMS_KCL_SIDECAR")
+    if env:
+        return env
+    found = shutil.which(DEFAULT_BINARY)
+    if found:
+        return found
+    raise FileNotFoundError(
+        f"could not find the '{DEFAULT_BINARY}' sidecar binary. Put it on PATH, "
+        "set DDBSTREAMS_KCL_SIDECAR=/path/to/sidecar, or pass sidecar_path=..."
+    )
+
+
+class Worker:
+    def __init__(
+        self,
+        stream_arn: str,
+        lease_table: str,
+        processor: RecordProcessor,
+        *,
+        owner: Optional[str] = None,
+        region: Optional[str] = None,
+        max_leases: Optional[int] = None,
+        lease_duration_ms: Optional[int] = None,
+        poll_interval_ms: Optional[int] = None,
+        cycle_interval_ms: Optional[int] = None,
+        sidecar_path: Optional[str] = None,
+        sidecar_cmd: Optional[Sequence[str]] = None,
+    ) -> None:
+        self.stream_arn = stream_arn
+        self.lease_table = lease_table
+        self.processor = processor
+        self.owner = owner
+        self.region = region
+        self.max_leases = max_leases
+        self.lease_duration_ms = lease_duration_ms
+        self.poll_interval_ms = poll_interval_ms
+        self.cycle_interval_ms = cycle_interval_ms
+        # sidecar_cmd overrides everything (tests / custom launch); otherwise the
+        # resolved single binary.
+        self._cmd = list(sidecar_cmd) if sidecar_cmd else [sidecar_path or _discover_sidecar()]
+        self._proc: Optional[subprocess.Popen] = None
+        self._stdin_lock = threading.Lock()
+
+    def _env(self) -> dict:
+        env = dict(os.environ)
+        env["DDBSTREAMS_KCL_STREAM_ARN"] = self.stream_arn
+        env["DDBSTREAMS_KCL_LEASE_TABLE"] = self.lease_table
+        if self.owner:
+            env["DDBSTREAMS_KCL_OWNER"] = self.owner
+        if self.region:
+            env["AWS_REGION"] = self.region
+        for key, val in [
+            ("DDBSTREAMS_KCL_MAX_LEASES", self.max_leases),
+            ("DDBSTREAMS_KCL_LEASE_DURATION_MS", self.lease_duration_ms),
+            ("DDBSTREAMS_KCL_POLL_INTERVAL_MS", self.poll_interval_ms),
+            ("DDBSTREAMS_KCL_CYCLE_INTERVAL_MS", self.cycle_interval_ms),
+        ]:
+            if val is not None:
+                env[key] = str(val)
+        return env
+
+    def _send(self, msg: dict) -> None:
+        assert self._proc and self._proc.stdin
+        with self._stdin_lock:
+            if self._proc.stdin.closed:
+                return
+            self._proc.stdin.write(json.dumps(msg) + "\n")
+            self._proc.stdin.flush()
+
+    def stop(self) -> None:
+        """Request a graceful stop from another thread. The sidecar finishes its
+        current cycle, emits ``shutdown``, and :meth:`run` returns."""
+        proc = self._proc
+        if not proc or not proc.stdin:
+            return
+        try:
+            self._send({"type": "stop"})
+        except (BrokenPipeError, ValueError):
+            pass
+
+    def run(self) -> int:
+        """Run until the sidecar shuts down (all shards complete, stop, or the
+        process exits). Returns the sidecar's exit code. Ctrl-C triggers a
+        graceful stop."""
+        self._proc = subprocess.Popen(
+            self._cmd,
+            env=self._env(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,  # inherit: sidecar logs to our stderr
+            text=True,
+            bufsize=1,
+        )
+        proc = self._proc
+        assert proc.stdout is not None
+        try:
+            self._send({"type": "ready"})
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # ignore any non-protocol noise
+                self._handle(msg)
+                if msg.get("type") == "shutdown":
+                    break
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._stop()
+        return proc.wait()
+
+    def _handle(self, msg: dict) -> None:
+        kind = msg.get("type")
+        if kind == "records":
+            shard = msg["shard"]
+            records = [Record.from_wire(shard, r) for r in msg.get("records", [])]
+            self.processor.process_records(records)
+            # Ack: durably processed up to last_seq → sidecar checkpoints it.
+            self._send({"type": "checkpoint", "shard": shard, "seq": msg["last_seq"]})
+        elif kind == "shard_complete":
+            ended = getattr(self.processor, "shard_ended", None)
+            if callable(ended):
+                ended(msg["shard"])
+        # "shutdown" handled by the caller loop.
+
+    def _stop(self) -> None:
+        proc = self._proc
+        if not proc:
+            return
+        try:
+            if proc.stdin and not proc.stdin.closed:
+                try:
+                    self._send({"type": "stop"})
+                except (BrokenPipeError, ValueError):
+                    pass
+                with self._stdin_lock:
+                    if not proc.stdin.closed:
+                        proc.stdin.close()
+        finally:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            for stream in (proc.stdout, proc.stderr):
+                if stream and not stream.closed:
+                    stream.close()

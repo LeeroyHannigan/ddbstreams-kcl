@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ddbstreams-kcl"
+version = "0.0.1"
+description = "Python client for ddbstreams-kcl: a JVM-free DynamoDB Streams KCL consumer. Spawns the Rust sidecar and delivers ordered, checkpointed change records to your processor."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+# Intentionally zero runtime dependencies — the client is a thin stdio bridge to
+# the Rust sidecar, which owns all AWS/coordination logic.
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
