@@ -135,3 +135,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("[sidecar] stopped");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use std::sync::Mutex;
+
+    // Env is process-global; serialize the env-touching tests.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const VARS: &[&str] = &[
+        "DDBSTREAMS_KCL_STREAM_ARN",
+        "DDBSTREAMS_KCL_LEASE_TABLE",
+        "DDBSTREAMS_KCL_OWNER",
+        "DDBSTREAMS_KCL_MAX_LEASES",
+        "DDBSTREAMS_KCL_LEASE_DURATION_MS",
+        "DDBSTREAMS_KCL_POLL_INTERVAL_MS",
+        "DDBSTREAMS_KCL_CYCLE_INTERVAL_MS",
+        "HOSTNAME",
+    ];
+
+    fn clear() {
+        for v in VARS {
+            std::env::remove_var(v);
+        }
+    }
+
+    #[test]
+    fn missing_required_is_an_error() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear();
+        assert!(Config::from_env().is_err(), "no stream arn → error");
+        std::env::set_var("DDBSTREAMS_KCL_STREAM_ARN", "arn");
+        assert!(Config::from_env().is_err(), "no lease table → error");
+        clear();
+    }
+
+    #[test]
+    fn defaults_and_owner_fallback() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear();
+        std::env::set_var("DDBSTREAMS_KCL_STREAM_ARN", "arn");
+        std::env::set_var("DDBSTREAMS_KCL_LEASE_TABLE", "leases");
+        std::env::set_var("HOSTNAME", "host7");
+        let c = Config::from_env().unwrap();
+        assert_eq!(c.max_leases, 100);
+        assert_eq!(c.lease_duration_ms, 10_000);
+        assert_eq!(c.poll_interval_ms, 1_000);
+        assert_eq!(c.cycle_interval_ms, 1_000);
+        assert!(c.owner.starts_with("host7:"), "owner defaults to <host>:<pid>, got {}", c.owner);
+        clear();
+    }
+
+    #[test]
+    fn explicit_values_are_parsed() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear();
+        std::env::set_var("DDBSTREAMS_KCL_STREAM_ARN", "arn");
+        std::env::set_var("DDBSTREAMS_KCL_LEASE_TABLE", "leases");
+        std::env::set_var("DDBSTREAMS_KCL_OWNER", "worker-9");
+        std::env::set_var("DDBSTREAMS_KCL_MAX_LEASES", "5");
+        std::env::set_var("DDBSTREAMS_KCL_LEASE_DURATION_MS", "3000");
+        std::env::set_var("DDBSTREAMS_KCL_POLL_INTERVAL_MS", "200");
+        std::env::set_var("DDBSTREAMS_KCL_CYCLE_INTERVAL_MS", "250");
+        let c = Config::from_env().unwrap();
+        assert_eq!(c.owner, "worker-9");
+        assert_eq!(c.max_leases, 5);
+        assert_eq!(c.lease_duration_ms, 3000);
+        assert_eq!(c.poll_interval_ms, 200);
+        assert_eq!(c.cycle_interval_ms, 250);
+        clear();
+    }
+}
