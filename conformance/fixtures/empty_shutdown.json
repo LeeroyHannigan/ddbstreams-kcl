@@ -1,0 +1,12 @@
+{
+  "name": "empty_shutdown",
+  "description": "No records at all -- the sidecar shuts down immediately. The binding must handle a record-free lifecycle and return cleanly.",
+  "server_script": [
+    {"emit": {"type": "shutdown", "reason": "no_shards"}}
+  ],
+  "expect": {
+    "records_per_shard": {},
+    "record_order": {},
+    "shard_ended": []
+  }
+}

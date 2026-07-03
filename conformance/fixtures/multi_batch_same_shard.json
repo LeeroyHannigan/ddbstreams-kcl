@@ -1,0 +1,38 @@
+{
+  "name": "multi_batch_same_shard",
+  "description": "Two batches on the same shard delivered in order, each acked separately (proves per-shard sequential ordering and multiple checkpoints on one shard).",
+  "server_script": [
+    {
+      "emit": {
+        "type": "records",
+        "shard": "s0",
+        "last_seq": "2",
+        "records": [
+          {"event_name": "INSERT", "sequence_number": "1", "stream_view_type": "KEYS_ONLY", "keys": {"pk": {"S": "a"}}, "old_image": null},
+          {"event_name": "INSERT", "sequence_number": "2", "stream_view_type": "KEYS_ONLY", "keys": {"pk": {"S": "b"}}, "old_image": null}
+        ]
+      }
+    },
+    {"await_checkpoints": [{"shard": "s0", "seq": "2"}]},
+    {
+      "emit": {
+        "type": "records",
+        "shard": "s0",
+        "last_seq": "5",
+        "records": [
+          {"event_name": "MODIFY", "sequence_number": "3", "stream_view_type": "KEYS_ONLY", "keys": {"pk": {"S": "a"}}, "old_image": null},
+          {"event_name": "MODIFY", "sequence_number": "4", "stream_view_type": "KEYS_ONLY", "keys": {"pk": {"S": "b"}}, "old_image": null},
+          {"event_name": "REMOVE", "sequence_number": "5", "stream_view_type": "KEYS_ONLY", "keys": {"pk": {"S": "a"}}, "old_image": null}
+        ]
+      }
+    },
+    {"await_checkpoints": [{"shard": "s0", "seq": "5"}]},
+    {"emit": {"type": "shard_complete", "shard": "s0"}},
+    {"emit": {"type": "shutdown", "reason": "done"}}
+  ],
+  "expect": {
+    "records_per_shard": {"s0": 5},
+    "record_order": {"s0": ["1", "2", "3", "4", "5"]},
+    "shard_ended": ["s0"]
+  }
+}

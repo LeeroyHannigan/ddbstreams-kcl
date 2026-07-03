@@ -1,0 +1,21 @@
+{
+  "name": "amazon-dynamodb-streams-consumer",
+  "version": "0.1.0",
+  "description": "JVM-free DynamoDB Streams consumer for Node.js: ordered, checkpointed change records delivered via the shared Rust sidecar.",
+  "license": "Apache-2.0",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "files": [
+    "src/"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LeeroyHannigan/amazon-dynamodb-streams-consumer"
+  }
+}

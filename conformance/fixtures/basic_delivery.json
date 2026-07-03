@@ -1,0 +1,57 @@
+{
+  "name": "basic_delivery",
+  "description": "Two record batches across two shards, a malformed line the binding must ignore, checkpoint acks validated for both shards, one shard_complete, then shutdown.",
+  "server_script": [
+    {
+      "emit": {
+        "type": "records",
+        "shard": "s0",
+        "last_seq": "2",
+        "records": [
+          {
+            "event_name": "INSERT",
+            "sequence_number": "1",
+            "stream_view_type": "NEW_AND_OLD_IMAGES",
+            "keys": {"pk": {"S": "k1"}},
+            "new_image": {"pk": {"S": "k1"}, "active": {"Bool": true}, "n": {"N": "42"}},
+            "old_image": null
+          },
+          {
+            "event_name": "INSERT",
+            "sequence_number": "2",
+            "stream_view_type": "NEW_AND_OLD_IMAGES",
+            "keys": {"pk": {"S": "k2"}},
+            "new_image": {"pk": {"S": "k2"}, "active": {"Bool": false}},
+            "old_image": null
+          }
+        ]
+      }
+    },
+    {"emit_raw": "{not valid json"},
+    {
+      "emit": {
+        "type": "records",
+        "shard": "s1",
+        "last_seq": "9",
+        "records": [
+          {
+            "event_name": "MODIFY",
+            "sequence_number": "9",
+            "stream_view_type": "NEW_AND_OLD_IMAGES",
+            "keys": {"pk": {"S": "k9"}},
+            "new_image": {"pk": {"S": "k9"}},
+            "old_image": {"pk": {"S": "k9"}, "active": {"Bool": true}}
+          }
+        ]
+      }
+    },
+    {"await_checkpoints": [{"shard": "s0", "seq": "2"}, {"shard": "s1", "seq": "9"}]},
+    {"emit": {"type": "shard_complete", "shard": "s1"}},
+    {"emit": {"type": "shutdown", "reason": "done"}}
+  ],
+  "expect": {
+    "records_per_shard": {"s0": 2, "s1": 1},
+    "record_order": {"s0": ["1", "2"], "s1": ["9"]},
+    "shard_ended": ["s1"]
+  }
+}

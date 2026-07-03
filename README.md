@@ -38,7 +38,7 @@ communicates with it over stdin/stdout using a newline-delimited JSON protocol: 
 record batches, and the client replies with checkpoint acknowledgements.
 
 ```
-  Application (Python, ...)             Sidecar (Rust)                     AWS
+  Application (Python/Go/Node)          Sidecar (Rust)                     AWS
   ------------------------              --------------                     ---
   record processor    <-- records --   shard discovery & lineage
                       -- checkpoints -> DynamoDB leases                 DynamoDB Streams
@@ -48,6 +48,25 @@ record batches, and the client replies with checkpoint acknowledgements.
 
 Because all shard, lease, and checkpoint handling lives in the sidecar, adding a language is a small client
 that speaks the protocol — there is no JVM and no per-language reimplementation of the hard parts.
+
+## Clients
+
+Three clients ship today, all speaking the same protocol and verified against a
+shared [conformance suite](conformance/README.md):
+
+| Language | Package | Reference |
+|---|---|---|
+| Python | `amazon-dynamodb-streams-consumer` | [`clients/python`](clients/python/README.md) |
+| Go | `github.com/LeeroyHannigan/amazon-dynamodb-streams-consumer/clients/go` | [`clients/go`](clients/go/README.md) |
+| Node.js | `amazon-dynamodb-streams-consumer` (npm) | [`clients/node`](clients/node/README.md) |
+
+Sidecar delivery differs by ecosystem: the **Python** wheel bundles the sidecar
+binary, while the **Go** and **Node** clients download the matching sidecar on
+first use (checksum-verified, cached). Publishing status is alpha — Python is
+live on [TestPyPI](https://test.pypi.org/project/amazon-dynamodb-streams-consumer/);
+Go and Node packaging is in place but not yet published to their registries (see
+[Status](#status)). A worked example in each language is in its client README;
+the Python example below is representative.
 
 ## Getting started (Python)
 
@@ -129,6 +148,9 @@ lease. A worker that takes over a shard resumes immediately after that sequence 
 | `amazon-dynamodb-streams-consumer-protocol` | The client/sidecar wire protocol. |
 | `amazon-dynamodb-streams-consumer-sidecar` | The consumer process a language client runs. |
 | `clients/python` | The Python client (`dynamodb_streams_consumer`). |
+| `clients/go` | The Go client (`ddbstreams`). |
+| `clients/node` | The Node.js client (`amazon-dynamodb-streams-consumer`). |
+| `conformance` | Language-agnostic protocol fixtures + replay sidecar every client is tested against. |
 
 ## Building and testing
 
@@ -142,6 +164,12 @@ DDB_STREAMS_CONSUMER_IT=1 AWS_REGION=us-east-1 cargo test --workspace --features
 
 # Python client tests
 cd clients/python && python3 -m unittest discover -s tests
+
+# Go client tests (unit + shared conformance; needs python3 for the replay sidecar)
+cd clients/go && go test ./...
+
+# Node client tests (unit + shared conformance; needs python3 for the replay sidecar)
+cd clients/node && node --test
 
 # Build a Python wheel with the sidecar bundled (installs a working consumer)
 bash clients/python/build_wheel.sh

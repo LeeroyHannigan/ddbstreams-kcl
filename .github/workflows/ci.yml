@@ -50,6 +50,44 @@ jobs:
         working-directory: clients/python
         run: python -m unittest discover -s tests
 
+  go:
+    name: Go client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+      # Python is needed for the shared conformance replay sidecar.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: gofmt
+        working-directory: clients/go
+        run: test -z "$(gofmt -l .)" || { echo 'run gofmt -w'; gofmt -l .; exit 1; }
+      - name: go vet
+        working-directory: clients/go
+        run: go vet ./...
+      - name: Test (unit + conformance)
+        working-directory: clients/go
+        run: go test ./...
+
+  node:
+    name: Node client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # Python is needed for the shared conformance replay sidecar.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Test (unit + conformance)
+        working-directory: clients/node
+        run: node --test
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
