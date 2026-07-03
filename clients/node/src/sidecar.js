@@ -3,14 +3,18 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const http = require('node:http');
 const https = require('node:https');
 const crypto = require('node:crypto');
 
 const BINARY = 'amazon-dynamodb-streams-consumer-sidecar';
 const VERSION = '0.1.0';
-const RELEASE_BASE =
-  process.env.DDB_STREAMS_CONSUMER_RELEASE_BASE ||
+const DEFAULT_RELEASE_BASE =
   'https://github.com/LeeroyHannigan/amazon-dynamodb-streams-consumer/releases/download';
+
+function releaseBase() {
+  return process.env.DDB_STREAMS_CONSUMER_RELEASE_BASE || DEFAULT_RELEASE_BASE;
+}
 
 // Maps Node's platform/arch to the stable release asset naming (os in
 // {linux,darwin,windows}, arch in {x86_64,aarch64}) -- the same language-neutral
@@ -33,7 +37,8 @@ function cachePath() {
 function httpGet(url, redirects = 0) {
   return new Promise((resolve, reject) => {
     if (redirects > 5) return reject(new Error('too many redirects'));
-    https
+    const mod = url.startsWith('http://') ? http : https;
+    mod
       .get(url, (res) => {
         const { statusCode, headers } = res;
         if (statusCode >= 300 && statusCode < 400 && headers.location) {
@@ -58,7 +63,7 @@ function httpGet(url, redirects = 0) {
 async function download(dst) {
   const { osName, arch, ext } = platformArch();
   const asset = `${BINARY}-${osName}-${arch}${ext}`;
-  const binURL = `${RELEASE_BASE.replace(/\/$/, '')}/v${VERSION}/${asset}`;
+  const binURL = `${releaseBase().replace(/\/$/, '')}/v${VERSION}/${asset}`;
   const want = (await httpGet(binURL + '.sha256')).toString().trim().split(/\s+/)[0];
   const body = await httpGet(binURL);
   const got = crypto.createHash('sha256').update(body).digest('hex');
