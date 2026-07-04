@@ -19,10 +19,10 @@ case "${OSTYPE:-}" in
 esac
 
 if [ -n "$target" ]; then
-  (cd "$root" && cargo build --release -p "$bin_name" --target "$target")
+  (cd "$root" && cargo build --release -p "$bin_name" --features otel --target "$target")
   built="$root/target/$target/release/${bin_name}${ext}"
 else
-  (cd "$root" && cargo build --release -p "$bin_name")
+  (cd "$root" && cargo build --release -p "$bin_name" --features otel)
   built="$root/target/release/${bin_name}${ext}"
 fi
 

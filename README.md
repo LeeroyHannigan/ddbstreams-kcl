@@ -29,6 +29,7 @@ project is not yet recommended for production use. Feedback and issues are welco
 - Multi-worker coordination through a DynamoDB lease table, with automatic shard balancing and failover.
 - At-least-once processing with checkpointing; a worker resumes from the last checkpoint after failure.
 - Horizontal scaling by running additional worker processes — no configuration changes required.
+- Optional metrics (consumer lag / `MillisBehindLatest`, throughput, shard lifecycle) exported over OpenTelemetry (OTLP), including directly to Amazon CloudWatch's native OTLP endpoint with no collector.
 - Language clients that are thin and dependency-free; the Rust core and sidecar contain all coordination logic.
 
 ## Architecture
@@ -137,6 +138,38 @@ are taken over automatically.
 **Checkpointing.** After a batch is processed and acknowledged, the last sequence number is stored on the
 lease. A worker that takes over a shard resumes immediately after that sequence number.
 
+## Metrics
+
+Metrics are optional and off by default — the engine emits through a pluggable sink, and with none attached
+there is zero overhead. The published sidecar (the binary bundled in the Python wheel and the one the Go/Node
+clients auto-download) includes OpenTelemetry (OTLP/HTTP) export, so **enabling metrics is configuration
+only — no rebuild**. Set the standard `OTEL_*` environment variables where your consumer runs:
+
+```
+OTEL_METRICS_EXPORTER=otlp
+OTEL_EXPORTER_OTLP_ENDPOINT=https://collector.example:4318
+OTEL_SERVICE_NAME=orders-consumer
+```
+
+The same exporter targets any OTLP backend (an OpenTelemetry Collector, Prometheus, a vendor endpoint). When
+the endpoint is Amazon CloudWatch's **native OTLP metrics endpoint**
+(`https://monitoring.<region>.amazonaws.com/v1/metrics`), requests are AWS SigV4-signed automatically using
+the ambient credentials (IAM permission `cloudwatch:PutMetricData`), so metrics land in CloudWatch with no
+collector to run.
+
+Emitted metrics (dimensioned by `shard_id` where applicable):
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `ddbstreams.consumer.millis_behind_latest` | gauge (ms) | Consumer lag: now − the newest record's approximate creation time |
+| `ddbstreams.consumer.records_processed` | counter | Records delivered to the processor |
+| `ddbstreams.consumer.bytes_processed` | counter | Payload bytes delivered |
+| `ddbstreams.consumer.describe_stream.count` | counter | `DescribeStream` calls issued during shard sync |
+| `ddbstreams.consumer.shard_end.count` | counter | Shards that reached `SHARD_END` |
+
+If you build the sidecar from source, enable the exporter with the `otel` Cargo feature (see
+[Building and testing](#building-and-testing)); the prebuilt/published binaries already include it.
+
 ## Project layout
 
 | Crate / package | Description |
@@ -158,6 +191,9 @@ lease. A worker that takes over a shard resumes immediately after that sequence 
 # Build, unit test, and lint (no AWS access required)
 cargo test --workspace
 cargo clippy --workspace --all-targets --features aws
+
+# Build the sidecar with OpenTelemetry (OTLP) metrics export
+cargo build -p amazon-dynamodb-streams-consumer-sidecar --features otel
 
 # Integration tests against a live account
 DDB_STREAMS_CONSUMER_IT=1 AWS_REGION=us-east-1 cargo test --workspace --features aws
