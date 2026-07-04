@@ -10,6 +10,15 @@ single `vX.Y.Z` git tag releases the whole project.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-04
+
+### Fixed
+- Linux sidecar release assets are now statically linked (musl), removing the
+  glibc version dependency. The auto-downloaded sidecar (Go/Node clients) now
+  runs on any Linux — Amazon Linux 2, older distributions, minimal/`scratch`
+  containers; previously the binary required a newer glibc than some hosts
+  provide (`GLIBC_x.y not found`).
+
 ## [0.1.0] - 2026-07-02
 
 Initial alpha release.
@@ -26,5 +35,6 @@ Initial alpha release.
 - Sidecar binary and a newline-delimited JSON protocol for language clients.
 - Python client (`dynamodb_streams_consumer`) with a zero-dependency stdio bridge.
 
-[Unreleased]: https://github.com/LeeroyHannigan/amazon-dynamodb-streams-consumer/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/LeeroyHannigan/amazon-dynamodb-streams-consumer/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/LeeroyHannigan/amazon-dynamodb-streams-consumer/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/LeeroyHannigan/amazon-dynamodb-streams-consumer/releases/tag/v0.1.0

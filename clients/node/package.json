@@ -1,6 +1,6 @@
 {
   "name": "amazon-dynamodb-streams-consumer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "JVM-free DynamoDB Streams consumer for Node.js: ordered, checkpointed change records delivered via the shared Rust sidecar.",
   "license": "Apache-2.0",
   "main": "dist/index.js",

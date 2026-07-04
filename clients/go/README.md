@@ -6,7 +6,7 @@ and delivers ordered, checkpointed change records to your processor. This
 package is a thin stdio bridge over the JSON-Lines wire protocol — the same
 protocol the Python client uses.
 
-> **Alpha (0.1.0).** API and wire protocol may change before 1.0.
+> **Alpha (0.1.1).** API and wire protocol may change before 1.0.
 
 ## Install
 

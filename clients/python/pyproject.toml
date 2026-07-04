@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "amazon-dynamodb-streams-consumer"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python client for amazon-dynamodb-streams-consumer: a JVM-free DynamoDB Streams KCL consumer. Spawns the Rust sidecar and delivers ordered, checkpointed change records to your processor."
 readme = "README.md"
 requires-python = ">=3.8"

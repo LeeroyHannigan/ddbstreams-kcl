@@ -6,7 +6,7 @@ and delivers ordered, checkpointed change records to your processor — a thin
 stdio bridge over the same JSON-Lines wire protocol the Python and Go clients
 use. Zero runtime dependencies (Node stdlib only).
 
-> **Alpha (0.1.0).** API and wire protocol may change before 1.0.
+> **Alpha (0.1.1).** API and wire protocol may change before 1.0.
 
 ## Install
 

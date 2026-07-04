@@ -13,14 +13,14 @@ This library implements the same lease-based coordination and checkpointing mode
 Streams in Rust, and makes it available to other languages through a lightweight client. Applications
 implement a record processor; the library handles the rest.
 
-[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.1-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![codecov](https://codecov.io/gh/LeeroyHannigan/amazon-dynamodb-streams-consumer/branch/main/graph/badge.svg)](https://codecov.io/gh/LeeroyHannigan/amazon-dynamodb-streams-consumer)
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
 
 ## Status
 
-**0.1.0 — alpha.** The API and wire protocol may change before 1.0, and the
+**0.1.1 — alpha.** The API and wire protocol may change before 1.0, and the
 project is not yet recommended for production use. Feedback and issues are welcome.
 
 ## Features
