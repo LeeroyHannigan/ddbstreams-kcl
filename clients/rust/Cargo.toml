@@ -1,0 +1,21 @@
+[package]
+name = "amazon-dynamodb-streams-consumer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native, JVM-free DynamoDB Streams consumer for Rust. Ordered, checkpointed, lease-coordinated change delivery — runs in-process (no sidecar), depending on the worker/core crates directly."
+
+[dependencies]
+amazon-dynamodb-streams-consumer-core = { path = "../../core" }
+amazon-dynamodb-streams-consumer-worker = { path = "../../worker", features = ["aws"] }
+amazon-dynamodb-streams-consumer-source = { path = "../../source-ddbstreams", features = ["aws"] }
+amazon-dynamodb-streams-consumer-lease = { path = "../../lease-dynamodb", features = ["aws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+aws-config = "1"
+aws-sdk-dynamodb = "1"
+aws-sdk-dynamodbstreams = "1"
+serde_json = "1"
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

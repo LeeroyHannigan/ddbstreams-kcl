@@ -53,22 +53,27 @@ that speaks the protocol — there is no JVM and no per-language reimplementatio
 
 ## Clients
 
-Three clients ship today, all speaking the same protocol and verified against a
-shared [conformance suite](conformance/README.md):
+Four clients ship today. The Python, Go, and Node clients speak the same sidecar
+protocol and are verified against a shared [conformance suite](conformance/README.md);
+the Rust client runs **in-process** (no sidecar), depending on the engine crates
+directly.
 
 | Language | Package | Reference |
 |---|---|---|
 | Python | `amazon-dynamodb-streams-consumer` | [`clients/python`](clients/python/README.md) |
 | Go | `github.com/LeeroyHannigan/amazon-dynamodb-streams-consumer/clients/go` | [`clients/go`](clients/go/README.md) |
 | Node.js | `amazon-dynamodb-streams-consumer` (npm) | [`clients/node`](clients/node/README.md) |
+| Rust | `amazon-dynamodb-streams-consumer` (crates.io) | [`clients/rust`](clients/rust/README.md) |
 
 Sidecar delivery differs by ecosystem: the **Python** wheel bundles the sidecar
 binary, while the **Go** and **Node** clients download the matching sidecar on
-first use (checksum-verified, cached). Publishing status is alpha — Python is
-live on [TestPyPI](https://test.pypi.org/project/amazon-dynamodb-streams-consumer/);
-Go and Node packaging is in place but not yet published to their registries (see
-[Status](#status)). A worked example in each language is in its client README;
-the Python example below is representative.
+first use (checksum-verified, cached). The **Rust** client needs no sidecar at
+all — it links the engine directly and runs in-process. Publishing status is
+alpha — Python is live on
+[TestPyPI](https://test.pypi.org/project/amazon-dynamodb-streams-consumer/);
+Go, Node, and Rust packaging is in place but not yet published to their
+registries (see [Status](#status)). A worked example in each language is in its
+client README; the Python example below is representative.
 
 ## Getting started (Python)
 

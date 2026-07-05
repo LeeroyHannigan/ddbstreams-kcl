@@ -7,6 +7,7 @@ members = [
     "worker",
     "protocol",
     "sidecar",
+    "clients/rust",
 ]
 
 # Single source of truth for the version across every crate (lockstep). Bump
