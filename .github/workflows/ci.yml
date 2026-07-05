@@ -96,6 +96,22 @@ jobs:
         working-directory: clients/node
         run: npm test
 
+  dotnet:
+    name: .NET client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      # Python is needed for the shared conformance replay sidecar.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Test (unit + conformance)
+        working-directory: clients/dotnet
+        run: dotnet test
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest

@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>Amazon.DynamoDBStreams.Consumer</AssemblyName>
+    <RootNamespace>Amazon.DynamoDBStreams.Consumer</RootNamespace>
+    <PackageId>Amazon.DynamoDBStreams.Consumer</PackageId>
+    <Version>0.1.3</Version>
+    <Authors>amazon-dynamodb-streams-consumer contributors</Authors>
+    <Description>Native, JVM-free DynamoDB Streams consumer for .NET. Ordered, checkpointed, lease-coordinated change delivery via a bundled Rust sidecar over a JSON-Lines protocol — the same engine the Python/Go/Node clients use.</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/LeeroyHannigan/amazon-dynamodb-streams-consumer</RepositoryUrl>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Amazon.DynamoDBStreams.Consumer.Tests" />
+  </ItemGroup>
+
+</Project>
