@@ -187,10 +187,16 @@ public sealed class Worker
         string? Str(string prop) =>
             w.TryGetProperty(prop, out var el) && el.ValueKind == JsonValueKind.String ? el.GetString() : null;
 
-        Dictionary<string, object?>? Image(string prop) =>
-            w.TryGetProperty(prop, out var el) && el.ValueKind == JsonValueKind.Object
-                ? AttributeValueConverter.DecodeItem(el, fmt)
-                : null;
+        Dictionary<string, object?>? Image(string prop)
+        {
+            if (!w.TryGetProperty(prop, out var el) || el.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+            return fmt == RecordFormat.Sdk
+                ? SdkAttributeValues.DecodeItem(el)
+                : AttributeValueConverter.DecodeItem(el, fmt);
+        }
 
         return new Record
         {

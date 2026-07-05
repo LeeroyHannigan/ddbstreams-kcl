@@ -20,4 +20,10 @@
     <InternalsVisibleTo Include="Amazon.DynamoDBStreams.Consumer.Tests" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Used only by RecordFormat.Sdk (typed AttributeValue drop-in). AWS-only
+         library, so a direct dependency keeps a single coherent package. -->
+    <PackageReference Include="AWSSDK.DynamoDBv2" Version="3.7.400" />
+  </ItemGroup>
+
 </Project>

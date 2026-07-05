@@ -90,6 +90,25 @@ new WorkerConfig
 
 Numbers stay strings in both modes to avoid precision loss.
 
+### SDK-native drop-in (`RecordFormat.Sdk`)
+
+For the smoothest migration off KCL, set `RecordFormat.Sdk`: each image value is
+an AWS SDK for .NET `Amazon.DynamoDBv2.Model.AttributeValue`, so a record drops
+straight into the SDK — no hand-conversion:
+
+```csharp
+using Amazon.DynamoDBv2.Model;
+
+new WorkerConfig { /* ... */ RecordFormat = RecordFormat.Sdk };
+
+// In the processor: write the changed item straight back with the SDK.
+Dictionary<string, AttributeValue> item = SdkAttributeValues.ToItem(r.NewImage);
+await ddb.PutItemAsync("Orders", item);
+```
+
+This pulls a dependency on `AWSSDK.DynamoDBv2` (a direct dependency of this
+client). `Native`/`DdbJson` users don't need to reference it themselves.
+
 ## Testing
 
 ```bash

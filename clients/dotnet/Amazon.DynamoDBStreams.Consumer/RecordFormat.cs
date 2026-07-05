@@ -21,4 +21,14 @@ public enum RecordFormat
     /// AWS SDK consumes — for SDK interop or migrating from KCL.
     /// </summary>
     DdbJson,
+
+    /// <summary>
+    /// The AWS SDK for .NET typed model: each attribute is an
+    /// <c>Amazon.DynamoDBv2.Model.AttributeValue</c>, so a record's images drop
+    /// straight into the SDK (PutItem, the document/object model, transactions) —
+    /// full KCL parity. Image values are <c>AttributeValue</c> instances; use
+    /// <c>SdkAttributeValues.ToItem(...)</c> for a typed
+    /// <c>Dictionary&lt;string, AttributeValue&gt;</c>.
+    /// </summary>
+    Sdk,
 }
