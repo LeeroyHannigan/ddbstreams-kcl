@@ -241,7 +241,9 @@ where
             .filter(|r| r.lease_key != LEADER_LEASE_KEY)
             .collect();
         for key in coordinator.tick(&shard_rows, now_ms) {
-            let _ = self.leases.acquire(&key, &self.config.owner).await; // best-effort
+            if self.leases.acquire(&key, &self.config.owner).await.is_ok() {
+                self.metrics.on_lease_acquired(&key); // best-effort
+            }
         }
 
         // 2) Re-read ownership + completion; rebuild the shard graph from leases
@@ -264,6 +266,7 @@ where
             .filter(|r| r.owner.as_deref() == Some(owner) && !r.completed)
             .map(|r| (r.lease_key.clone(), (r.lease_counter, r.checkpoint.clone())))
             .collect();
+        self.metrics.on_leases_held(owned.len() as u64);
         let completed: HashSet<ShardId> = shard_rows
             .iter()
             .filter(|r| r.completed)
@@ -525,6 +528,7 @@ where
                 Ok(Some(ack)) => match leases.checkpoint(&shard, &owner, counter, &ack).await {
                     Ok(c) => counter = c,
                     Err(_) => {
+                        metrics.on_lease_lost(&shard);
                         let _ = consumer.lease_lost().await; // lease lost → notify + stop
                         return Ok(());
                     }
@@ -535,6 +539,7 @@ where
                     match leases.renew(&shard, &owner, counter).await {
                         Ok(c) => counter = c,
                         Err(_) => {
+                            metrics.on_lease_lost(&shard);
                             let _ = consumer.lease_lost().await;
                             return Ok(());
                         }

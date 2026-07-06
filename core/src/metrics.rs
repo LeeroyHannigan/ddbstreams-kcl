@@ -37,6 +37,11 @@ pub trait MetricsSink: Send + Sync {
     fn on_describe_stream(&self) {}
     /// This worker acquired (or created) a lease.
     fn on_lease_acquired(&self, _shard_id: &str) {}
+    /// This worker lost a lease (stolen by another worker or expired).
+    fn on_lease_lost(&self, _shard_id: &str) {}
+    /// Number of shard leases this worker currently holds, reported once per
+    /// coordination cycle. Exported as a gauge for rebalance/failover health.
+    fn on_leases_held(&self, _count: u64) {}
 }
 
 /// Default sink that records nothing — metrics are opt-in and cost nothing when
@@ -106,6 +111,38 @@ mod tests {
         });
         s.on_shard_end("s");
         s.on_describe_stream();
+        s.on_lease_acquired("s");
+        s.on_lease_lost("s");
+        s.on_leases_held(3);
         // Nothing to assert — just proving the default impls are callable/inert.
+    }
+
+    #[derive(Default)]
+    struct LeaseCapture {
+        acquired: Mutex<Vec<String>>,
+        lost: Mutex<Vec<String>>,
+        held: Mutex<Vec<u64>>,
+    }
+    impl MetricsSink for LeaseCapture {
+        fn on_lease_acquired(&self, s: &str) {
+            self.acquired.lock().unwrap().push(s.to_string());
+        }
+        fn on_lease_lost(&self, s: &str) {
+            self.lost.lock().unwrap().push(s.to_string());
+        }
+        fn on_leases_held(&self, n: u64) {
+            self.held.lock().unwrap().push(n);
+        }
+    }
+
+    #[test]
+    fn sink_receives_lease_lifecycle_events() {
+        let c = LeaseCapture::default();
+        c.on_lease_acquired("s0");
+        c.on_lease_lost("s0");
+        c.on_leases_held(2);
+        assert_eq!(*c.acquired.lock().unwrap(), vec!["s0".to_string()]);
+        assert_eq!(*c.lost.lock().unwrap(), vec!["s0".to_string()]);
+        assert_eq!(*c.held.lock().unwrap(), vec![2]);
     }
 }

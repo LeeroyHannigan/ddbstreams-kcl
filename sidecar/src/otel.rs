@@ -17,13 +17,17 @@
 //! points at the CloudWatch endpoint and gets metrics with no collector and no
 //! bespoke CloudWatch sink.
 //!
-//! Emits the KCL/KCA-parity signals (dimensioned by `shard_id` where applicable):
+//! Emits the KCL/KCA-parity signals. Every metric carries `worker` and `stream`
+//! dimensions (from `DDB_STREAMS_CONSUMER_OWNER` / `_STREAM_ARN`), matching KCL's
+//! WorkerIdentifier/StreamId; shard-scoped metrics add `shard_id`:
 //!
 //! - `ddbstreams.consumer.millis_behind_latest` (gauge, ms) — consumer lag
 //! - `ddbstreams.consumer.records_processed` (counter)
 //! - `ddbstreams.consumer.bytes_processed` (counter)
 //! - `ddbstreams.consumer.describe_stream.count` (counter)
 //! - `ddbstreams.consumer.shard_end.count` (counter)
+//! - `ddbstreams.consumer.lease.acquired` / `.lease.lost` (counters)
+//! - `ddbstreams.consumer.lease.held` (gauge) — leases held by this worker
 
 use amazon_dynamodb_streams_consumer_core::metrics::{MetricsSink, ShardMetrics};
 use opentelemetry::metrics::{Counter, Gauge, Meter, MeterProvider};
@@ -41,6 +45,12 @@ pub struct OtelMetricsSink {
     bytes: Counter<u64>,
     describes: Counter<u64>,
     shard_ends: Counter<u64>,
+    lease_acquired: Counter<u64>,
+    lease_lost: Counter<u64>,
+    leases_held: Gauge<u64>,
+    /// Dimensions applied to every metric (worker id, stream) so load can be
+    /// attributed per host/stream, matching KCL's WorkerIdentifier/StreamId.
+    base_attrs: Vec<KeyValue>,
 }
 
 impl OtelMetricsSink {
@@ -115,6 +125,32 @@ impl OtelMetricsSink {
             .u64_counter("ddbstreams.consumer.shard_end.count")
             .with_description("Shards that reached SHARD_END")
             .build();
+        let lease_acquired = meter
+            .u64_counter("ddbstreams.consumer.lease.acquired")
+            .with_description("Shard leases this worker acquired or created")
+            .build();
+        let lease_lost = meter
+            .u64_counter("ddbstreams.consumer.lease.lost")
+            .with_description("Shard leases this worker lost (stolen or expired)")
+            .build();
+        let leases_held = meter
+            .u64_gauge("ddbstreams.consumer.lease.held")
+            .with_description("Shard leases this worker currently holds")
+            .build();
+
+        // Base dimensions on every metric: worker id + stream, from the same env
+        // the sidecar already uses. Empty values are omitted.
+        let mut base_attrs = Vec::new();
+        if let Ok(owner) = std::env::var("DDB_STREAMS_CONSUMER_OWNER") {
+            if !owner.is_empty() {
+                base_attrs.push(KeyValue::new("worker", owner));
+            }
+        }
+        if let Ok(stream) = std::env::var("DDB_STREAMS_CONSUMER_STREAM_ARN") {
+            if !stream.is_empty() {
+                base_attrs.push(KeyValue::new("stream", stream));
+            }
+        }
 
         Ok(Self {
             _provider: provider,
@@ -123,6 +159,10 @@ impl OtelMetricsSink {
             bytes,
             describes,
             shard_ends,
+            lease_acquired,
+            lease_lost,
+            leases_held,
+            base_attrs,
         })
     }
 
@@ -132,9 +172,19 @@ impl OtelMetricsSink {
     }
 }
 
+impl OtelMetricsSink {
+    /// Build the attribute set for a shard-scoped metric: base dimensions
+    /// (worker/stream) plus `shard_id`.
+    fn shard_attrs(&self, shard_id: &str) -> Vec<KeyValue> {
+        let mut a = self.base_attrs.clone();
+        a.push(KeyValue::new("shard_id", shard_id.to_string()));
+        a
+    }
+}
+
 impl MetricsSink for OtelMetricsSink {
     fn on_batch(&self, m: &ShardMetrics<'_>) {
-        let attrs = [KeyValue::new("shard_id", m.shard_id.to_string())];
+        let attrs = self.shard_attrs(m.shard_id);
         self.records.add(m.records, &attrs);
         self.bytes.add(m.bytes, &attrs);
         if let Some(lag) = m.millis_behind_latest {
@@ -142,11 +192,19 @@ impl MetricsSink for OtelMetricsSink {
         }
     }
     fn on_shard_end(&self, shard_id: &str) {
-        self.shard_ends
-            .add(1, &[KeyValue::new("shard_id", shard_id.to_string())]);
+        self.shard_ends.add(1, &self.shard_attrs(shard_id));
     }
     fn on_describe_stream(&self) {
-        self.describes.add(1, &[]);
+        self.describes.add(1, &self.base_attrs);
+    }
+    fn on_lease_acquired(&self, shard_id: &str) {
+        self.lease_acquired.add(1, &self.shard_attrs(shard_id));
+    }
+    fn on_lease_lost(&self, shard_id: &str) {
+        self.lease_lost.add(1, &self.shard_attrs(shard_id));
+    }
+    fn on_leases_held(&self, count: u64) {
+        self.leases_held.record(count, &self.base_attrs);
     }
 }
 
