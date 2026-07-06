@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -43,6 +44,9 @@ type Config struct {
 	LeaseDurationMS int
 	PollIntervalMS  int
 	CycleIntervalMS int
+	// InitialPosition selects where a freshly-seeded shard begins reading.
+	// Values: "TRIM_HORIZON" (default) or "LATEST".
+	InitialPosition string
 
 	// SidecarPath overrides sidecar discovery with an explicit binary path.
 	SidecarPath string
@@ -102,6 +106,9 @@ func (w *Worker) env() []string {
 	}
 	if w.cfg.CycleIntervalMS > 0 {
 		add("DDB_STREAMS_CONSUMER_CYCLE_INTERVAL_MS", strconv.Itoa(w.cfg.CycleIntervalMS))
+	}
+	if w.cfg.InitialPosition != "" {
+		add("DDB_STREAMS_CONSUMER_INITIAL_POSITION", strings.ToUpper(strings.TrimSpace(w.cfg.InitialPosition)))
 	}
 	return env
 }

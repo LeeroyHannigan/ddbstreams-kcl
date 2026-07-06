@@ -233,6 +233,7 @@ async fn live_reshard_correctness() {
                     max_leases: 1024,
                     lease_duration_ms: 60_000,
                     poll_interval_ms: 200,
+                    initial_position: Default::default(),
                 },
             );
             let mut coord = LeaseCoordinator::new(format!("reshard-w-{pid}"), 1024, 60_000);

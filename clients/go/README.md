@@ -99,6 +99,20 @@ ddbstreams.New(ddbstreams.Config{
 Numbers stay strings in both modes to avoid precision loss. This is a
 client-side presentation choice — the wire protocol is unchanged.
 
+## Start position
+
+`Config.InitialPosition` controls where a freshly-seeded shard begins reading.
+It is optional and accepts `"TRIM_HORIZON"` (default) or `"LATEST"`. The value
+is trimmed and upper-cased before being passed to the sidecar, so `"latest"`
+and `"LATEST"` are equivalent.
+
+```go
+ddbstreams.New(ddbstreams.Config{
+	// ...
+	InitialPosition: "LATEST", // default is "TRIM_HORIZON"
+})
+```
+
 ## Testing
 
 ```bash

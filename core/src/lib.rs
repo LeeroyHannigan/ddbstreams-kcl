@@ -29,6 +29,137 @@ pub type ShardId = String;
 /// `AFTER_SEQUENCE_NUMBER` iterator (matching KCL, which treats it as opaque).
 pub type SequenceNumber = String;
 
+// Non-numeric sentinels persisted in the lease `checkpoint` column to record the
+// position a shard was seeded at, before any real record has been checkpointed.
+// A real DynamoDB Streams sequence number is a long decimal string, so these
+// never collide with one. `TRIM_HORIZON` seeds as the natural empty checkpoint
+// (`None`); other modes persist their sentinel and are decoded by
+// [`StartPosition::from_checkpoint`].
+const SENTINEL_LATEST: &str = "LATEST";
+
+/// Where a shard begins reading when its lease is first seeded and no per-record
+/// checkpoint exists yet. A worker-level setting; once a shard checkpoints a real
+/// record this no longer applies to it.
+///
+/// `#[non_exhaustive]`: additional start modes may be added, so `match`es on this
+/// type must carry a wildcard arm.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InitialPosition {
+    /// Start at the oldest untrimmed record in the shard.
+    #[default]
+    TrimHorizon,
+    /// Start at the tip — only records that arrive after the consumer starts.
+    Latest,
+}
+
+impl InitialPosition {
+    /// The lease `checkpoint` value to persist when first seeding a shard at this
+    /// position. `None` is the natural "from the beginning" checkpoint; other
+    /// positions persist a sentinel decoded by [`StartPosition::from_checkpoint`].
+    pub fn seed_checkpoint(self) -> Option<String> {
+        StartPosition::from(self).as_checkpoint()
+    }
+
+    /// Parse a caller-supplied name (case-insensitive) into an [`InitialPosition`].
+    /// Unknown values return `None` so callers can reject or fall back.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_uppercase().as_str() {
+            "TRIM_HORIZON" | "TRIM-HORIZON" | "TRIMHORIZON" => Some(Self::TrimHorizon),
+            "LATEST" => Some(Self::Latest),
+            _ => None,
+        }
+    }
+}
+
+/// The resolved position from which a fresh shard iterator is derived. `After`
+/// carries a durable per-record checkpoint; the other variants are start modes
+/// used before any record has been checkpointed.
+///
+/// `#[non_exhaustive]`: `match`es must carry a wildcard arm.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StartPosition {
+    /// Oldest untrimmed record.
+    TrimHorizon,
+    /// Tip of the shard.
+    Latest,
+    /// Strictly after a specific, already-processed sequence number.
+    After(SequenceNumber),
+}
+
+impl From<InitialPosition> for StartPosition {
+    fn from(p: InitialPosition) -> Self {
+        match p {
+            InitialPosition::TrimHorizon => StartPosition::TrimHorizon,
+            InitialPosition::Latest => StartPosition::Latest,
+        }
+    }
+}
+
+impl StartPosition {
+    /// Decode a persisted lease checkpoint into a start position. `None` and any
+    /// recognised sentinel map to a start mode; any other value is treated as a
+    /// real sequence number (`After`).
+    pub fn from_checkpoint(checkpoint: Option<&str>) -> Self {
+        match checkpoint {
+            None => StartPosition::TrimHorizon,
+            Some(s) if s == SENTINEL_LATEST => StartPosition::Latest,
+            Some(seq) => StartPosition::After(seq.to_string()),
+        }
+    }
+
+    /// Encode as a persisted checkpoint value. Modes meaning "from the beginning"
+    /// persist as `None`; other start modes persist their sentinel; `After`
+    /// persists its sequence number.
+    pub fn as_checkpoint(&self) -> Option<String> {
+        match self {
+            StartPosition::TrimHorizon => None,
+            StartPosition::Latest => Some(SENTINEL_LATEST.to_string()),
+            StartPosition::After(seq) => Some(seq.clone()),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    /// True if this position is a start mode (no real record processed yet),
+    /// i.e. not [`StartPosition::After`].
+    pub fn is_start_mode(&self) -> bool {
+        !matches!(self, StartPosition::After(_))
+    }
+}
+
+/// The checkpoint a freshly-discovered child shard should be seeded with, given
+/// its parents' current lease checkpoints.
+///
+/// A child normally starts from its own beginning (`None` = TRIM_HORIZON) so no
+/// records are skipped across a reshard. The one exception: if every parent
+/// completed *without ever checkpointing a real record* and they all carried the
+/// same start mode (e.g. a tip-only shard that produced nothing under `Latest`),
+/// the child inherits that start mode — otherwise a fresh consumer would replay
+/// the child's history that the parent deliberately skipped. Generic over the
+/// start mode, so it holds for any non-`After` position.
+pub fn child_seed_checkpoint(parent_checkpoints: &[Option<String>]) -> Option<String> {
+    if parent_checkpoints.is_empty() {
+        return None;
+    }
+    let mut inherited: Option<StartPosition> = None;
+    for cp in parent_checkpoints {
+        match StartPosition::from_checkpoint(cp.as_deref()) {
+            // Parent means "from the beginning" or processed real records → the
+            // child reads from its own beginning.
+            StartPosition::TrimHorizon | StartPosition::After(_) => return None,
+            mode => match &inherited {
+                None => inherited = Some(mode),
+                Some(cur) if *cur == mode => {}
+                // Mixed start modes across parents → beginning.
+                Some(_) => return None,
+            },
+        }
+    }
+    inherited.and_then(|s| s.as_checkpoint())
+}
+
 #[derive(Clone, Debug)]
 pub struct Record {
     pub shard_id: ShardId,
@@ -168,6 +299,95 @@ impl<S: StreamSource, L: LeaseStore> Scheduler<S, L> {
 // ---------------------------------------------------------------------------
 // In-memory fakes for testing the ordering core without AWS.
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod start_position_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_trim_horizon() {
+        assert_eq!(InitialPosition::default(), InitialPosition::TrimHorizon);
+        assert_eq!(InitialPosition::TrimHorizon.seed_checkpoint(), None);
+    }
+
+    #[test]
+    fn latest_seeds_and_decodes_via_sentinel() {
+        let cp = InitialPosition::Latest.seed_checkpoint();
+        assert_eq!(cp.as_deref(), Some("LATEST"));
+        assert_eq!(
+            StartPosition::from_checkpoint(cp.as_deref()),
+            StartPosition::Latest
+        );
+    }
+
+    #[test]
+    fn none_and_real_seq_decode_correctly() {
+        assert_eq!(
+            StartPosition::from_checkpoint(None),
+            StartPosition::TrimHorizon
+        );
+        // A real DDB sequence number is a long decimal string.
+        let seq = "100000000000000000000000001";
+        assert_eq!(
+            StartPosition::from_checkpoint(Some(seq)),
+            StartPosition::After(seq.to_string())
+        );
+    }
+
+    #[test]
+    fn parse_is_case_insensitive_and_rejects_unknown() {
+        assert_eq!(
+            InitialPosition::parse("latest"),
+            Some(InitialPosition::Latest)
+        );
+        assert_eq!(
+            InitialPosition::parse("  TRIM_HORIZON "),
+            Some(InitialPosition::TrimHorizon)
+        );
+        assert_eq!(InitialPosition::parse("tip"), None);
+    }
+
+    #[test]
+    fn root_shard_has_no_parents_to_inherit_from() {
+        assert_eq!(child_seed_checkpoint(&[]), None);
+    }
+
+    #[test]
+    fn child_starts_at_beginning_when_parent_processed_records() {
+        // Parent has a real checkpoint → child reads from its own beginning so
+        // nothing is skipped across the reshard.
+        let parent = vec![Some("100000000000000000000000009".to_string())];
+        assert_eq!(child_seed_checkpoint(&parent), None);
+    }
+
+    #[test]
+    fn child_starts_at_beginning_under_default_trim_horizon() {
+        // Parent seeded at TRIM_HORIZON (None), completed → child TRIM_HORIZON.
+        assert_eq!(child_seed_checkpoint(&[None]), None);
+    }
+
+    #[test]
+    fn child_inherits_start_mode_when_parent_completed_without_records() {
+        // Parent seeded at LATEST produced nothing (still the sentinel) → the
+        // child inherits it, so a fresh consumer does not replay history the
+        // parent deliberately skipped.
+        let parent = vec![Some("LATEST".to_string())];
+        assert_eq!(child_seed_checkpoint(&parent).as_deref(), Some("LATEST"));
+    }
+
+    #[test]
+    fn merge_child_inherits_only_when_all_parents_agree() {
+        // Both parents skipped history under the same mode → inherit.
+        let both = vec![Some("LATEST".to_string()), Some("LATEST".to_string())];
+        assert_eq!(child_seed_checkpoint(&both).as_deref(), Some("LATEST"));
+        // One parent processed records → child from beginning (no loss).
+        let mixed = vec![
+            Some("LATEST".to_string()),
+            Some("100000000000000000000000009".to_string()),
+        ];
+        assert_eq!(child_seed_checkpoint(&mixed), None);
+    }
+}
 
 #[cfg(test)]
 mod tests {

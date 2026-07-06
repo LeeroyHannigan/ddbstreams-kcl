@@ -326,6 +326,7 @@ impl DynamoDbLeaseStore {
         &self,
         lease_key: &str,
         parents: &[String],
+        checkpoint: Option<&str>,
     ) -> Result<(), LeaseError> {
         let mut put = self
             .client
@@ -334,6 +335,9 @@ impl DynamoDbLeaseStore {
             .item(LEASE_KEY, AttributeValue::S(lease_key.to_string()))
             .item(LEASE_COUNTER, AttributeValue::N("0".into()))
             .condition_expression("attribute_not_exists(leaseKey)");
+        if let Some(cp) = checkpoint {
+            put = put.item(CHECKPOINT, AttributeValue::S(cp.to_string()));
+        }
         if !parents.is_empty() {
             put = put.item(
                 PARENTS,

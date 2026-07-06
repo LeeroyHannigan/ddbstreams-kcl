@@ -167,6 +167,10 @@ public final class Worker {
         if (config.cycleIntervalMs != null) {
             e.put("DDB_STREAMS_CONSUMER_CYCLE_INTERVAL_MS", config.cycleIntervalMs.toString());
         }
+        if (config.initialPosition != null) {
+            e.put("DDB_STREAMS_CONSUMER_INITIAL_POSITION",
+                    config.initialPosition.trim().toUpperCase(java.util.Locale.ROOT));
+        }
     }
 
     private void stopInternal(OutputStream stdin) {

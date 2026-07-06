@@ -10,7 +10,7 @@
 //! (awslabs/dynamodb-streams-kinesis-adapter, Apache-2.0). See core/REFERENCES.md.
 
 use crate::{build_shard_graph, close_open_parents, DdbShard};
-use amazon_dynamodb_streams_consumer_core::{Record, RecordBatch, ShardMeta};
+use amazon_dynamodb_streams_consumer_core::{Record, RecordBatch, ShardMeta, StartPosition};
 use aws_sdk_dynamodbstreams::types::ShardIteratorType;
 use aws_sdk_dynamodbstreams::Client;
 use std::collections::HashMap;
@@ -150,18 +150,24 @@ impl DdbStreamsSource {
         Ok(out)
     }
 
-    /// Derive a *fresh* iterator from the stream via `GetShardIterator`
-    /// (`AFTER_SEQUENCE_NUMBER` when resuming from a checkpoint, else
-    /// `TRIM_HORIZON`). Used on first read, reposition, or after an
-    /// expired/trimmed iterator — not on the steady-state poll path.
+    /// Derive a *fresh* iterator from the stream via `GetShardIterator`. The
+    /// starting position is decoded from the opaque checkpoint `after`
+    /// (`AFTER_SEQUENCE_NUMBER` when resuming from a real sequence number, else
+    /// the seeded start mode — `TRIM_HORIZON` by default). Used on first read,
+    /// reposition, or after an expired/trimmed iterator — not on the steady-state
+    /// poll path.
     async fn derive_iterator(
         &self,
         shard: &str,
         after: Option<&str>,
     ) -> Result<Option<String>, BoxError> {
-        let (iter_type, seq) = match after {
-            Some(s) => (ShardIteratorType::AfterSequenceNumber, Some(s.to_string())),
-            None => (ShardIteratorType::TrimHorizon, None),
+        let (iter_type, seq) = match StartPosition::from_checkpoint(after) {
+            StartPosition::After(s) => (ShardIteratorType::AfterSequenceNumber, Some(s)),
+            StartPosition::Latest => (ShardIteratorType::Latest, None),
+            StartPosition::TrimHorizon => (ShardIteratorType::TrimHorizon, None),
+            // Non-exhaustive: any future start mode falls back to TRIM_HORIZON
+            // until it derives its own iterator type here.
+            _ => (ShardIteratorType::TrimHorizon, None),
         };
         let resp = self
             .client

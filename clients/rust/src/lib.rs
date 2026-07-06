@@ -54,6 +54,7 @@ use std::time::Instant;
 
 use amazon_dynamodb_streams_consumer_core::coordinator::LeaseCoordinator;
 pub use amazon_dynamodb_streams_consumer_core::record::{AttrValue, Item, StreamRecord};
+pub use amazon_dynamodb_streams_consumer_core::InitialPosition;
 use amazon_dynamodb_streams_consumer_core::{
     Record as CoreRecord, RecordProcessor as CoreProcessor, RecordProcessorFactory as CoreFactory,
     ShardId,
@@ -319,6 +320,7 @@ pub struct WorkerBuilder {
     max_leases: usize,
     lease_duration_ms: u64,
     poll_interval_ms: u64,
+    initial_position: InitialPosition,
     processor: Option<Arc<dyn RecordProcessorFactory>>,
 }
 
@@ -333,6 +335,7 @@ impl Default for WorkerBuilder {
             max_leases: 100,
             lease_duration_ms: 60_000,
             poll_interval_ms: 1_000,
+            initial_position: InitialPosition::default(),
             processor: None,
         }
     }
@@ -385,6 +388,14 @@ impl WorkerBuilder {
         self.poll_interval_ms = ms;
         self
     }
+    /// Where a shard begins when it is first consumed and has no checkpoint yet
+    /// (default [`InitialPosition::TrimHorizon`]). Applies only to shards seeded
+    /// while the lease table is empty; already-checkpointed shards and reshard
+    /// children are unaffected.
+    pub fn initial_position(mut self, position: InitialPosition) -> Self {
+        self.initial_position = position;
+        self
+    }
     /// The per-shard processor factory (required).
     pub fn processor(mut self, factory: Arc<dyn RecordProcessorFactory>) -> Self {
         self.processor = Some(factory);
@@ -428,6 +439,7 @@ impl WorkerBuilder {
                 max_leases: self.max_leases,
                 lease_duration_ms: self.lease_duration_ms,
                 poll_interval_ms: self.poll_interval_ms,
+                initial_position: self.initial_position,
             },
         );
 

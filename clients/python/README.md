@@ -85,6 +85,11 @@ environment (same as any AWS SDK).
 `owner`, `region`, `max_leases`, `lease_duration_ms`, `poll_interval_ms`,
 `cycle_interval_ms` — all optional keyword args on `Worker(...)`.
 
+`initial_position` — optional keyword arg on `Worker(...)` controlling where a
+freshly-seeded shard begins reading. Values are `TRIM_HORIZON` (the default —
+start at the oldest available record) and `LATEST` (start at the newest). Input
+is case-insensitive.
+
 ## Development
 
 ```bash

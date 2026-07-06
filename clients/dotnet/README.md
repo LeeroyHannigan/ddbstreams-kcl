@@ -109,6 +109,25 @@ await ddb.PutItemAsync("Orders", item);
 This pulls a dependency on `AWSSDK.DynamoDBv2` (a direct dependency of this
 client). `Native`/`DdbJson` users don't need to reference it themselves.
 
+## Start position
+
+For a shard with no stored checkpoint, `InitialPosition` controls where reading
+begins:
+
+```csharp
+new WorkerConfig
+{
+    // ...
+    InitialPosition = "LATEST", // default is "TRIM_HORIZON"
+}
+```
+
+- `TRIM_HORIZON` (default) — start from the oldest available record in the shard.
+- `LATEST` — start from records written after the worker begins.
+
+The value is case-insensitive. Shards that already have a checkpoint always
+resume from it, regardless of this setting.
+
 ## Testing
 
 ```bash

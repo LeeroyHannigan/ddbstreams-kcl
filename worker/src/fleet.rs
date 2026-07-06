@@ -17,7 +17,7 @@ use crate::{
 use amazon_dynamodb_streams_consumer_core::coordinator::{LeaseCoordinator, RawLease};
 use amazon_dynamodb_streams_consumer_core::leader::{shard_metas_from_leases, LEADER_LEASE_KEY};
 use amazon_dynamodb_streams_consumer_core::metrics::{noop_sink, ShardMetrics, SharedMetricsSink};
-use amazon_dynamodb_streams_consumer_core::ShardId;
+use amazon_dynamodb_streams_consumer_core::{child_seed_checkpoint, InitialPosition, ShardId};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -29,6 +29,11 @@ pub struct FleetConfig {
     pub lease_duration_ms: u64,
     /// Idle backoff between empty `GetRecords` polls inside a shard task.
     pub poll_interval_ms: u64,
+    /// Where freshly-seeded shards begin when they have no checkpoint yet
+    /// (default TRIM_HORIZON). Applied by the shard-sync leader at seed time;
+    /// reshard children inherit it only when a parent completed without ever
+    /// processing a record (see core `child_seed_checkpoint`).
+    pub initial_position: InitialPosition,
 }
 
 /// This worker's bid for shard-sync **leadership**, carried across coordination
@@ -325,10 +330,15 @@ where
         if !seeded {
             // One-time seed: full DescribeStream → create the root shards (those
             // whose parents are all complete; at bootstrap that's the roots).
+            // Roots begin at the configured initial position.
+            let seed_cp = self.config.initial_position.seed_checkpoint();
             self.metrics.on_describe_stream();
             for m in self.source.describe_shards().await? {
                 if m.parents.iter().all(|p| completed.contains(p)) && !existing.contains(&m.id) {
-                    let _ = self.leases.create_shard_lease(&m.id, &m.parents).await;
+                    let _ = self
+                        .leases
+                        .create_shard_lease(&m.id, &m.parents, seed_cp.as_deref())
+                        .await;
                 }
             }
             self.sync_state.lock().unwrap().seeded = true;
@@ -336,6 +346,20 @@ where
         }
 
         // Incremental: for each newly-completed parent, fetch ONLY its children.
+        // A child inherits its parents' start mode only if every parent completed
+        // without processing a record (core `child_seed_checkpoint`); otherwise it
+        // begins at TRIM_HORIZON so nothing is skipped across the reshard.
+        let child_cp = |parents: &[String]| -> Option<String> {
+            let cps: Vec<Option<String>> = parents
+                .iter()
+                .map(|p| {
+                    rows.iter()
+                        .find(|r| &r.lease_key == p)
+                        .and_then(|r| r.checkpoint.clone())
+                })
+                .collect();
+            child_seed_checkpoint(&cps)
+        };
         let mut newly_synced: Vec<ShardId> = Vec::new();
         for parent in &completed {
             if already_synced.contains(parent) || parents_with_children.contains(parent) {
@@ -346,7 +370,11 @@ where
                 Ok(children) => {
                     for c in children {
                         if !existing.contains(&c.id) {
-                            let _ = self.leases.create_shard_lease(&c.id, &c.parents).await;
+                            let cp = child_cp(&c.parents);
+                            let _ = self
+                                .leases
+                                .create_shard_lease(&c.id, &c.parents, cp.as_deref())
+                                .await;
                         }
                     }
                     newly_synced.push(parent.clone());
@@ -360,7 +388,11 @@ where
                             if m.parents.iter().all(|p| completed.contains(p))
                                 && !existing.contains(&m.id)
                             {
-                                let _ = self.leases.create_shard_lease(&m.id, &m.parents).await;
+                                let cp = child_cp(&m.parents);
+                                let _ = self
+                                    .leases
+                                    .create_shard_lease(&m.id, &m.parents, cp.as_deref())
+                                    .await;
                             }
                         }
                     }
@@ -622,6 +654,7 @@ mod tests {
             &self,
             key: &str,
             parents: &[ShardId],
+            checkpoint: Option<&str>,
         ) -> Result<(), WorkerError> {
             self.rows
                 .lock()
@@ -629,6 +662,7 @@ mod tests {
                 .entry(key.to_string())
                 .or_insert_with(|| State {
                     parents: parents.to_vec(),
+                    checkpoint: checkpoint.map(|s| s.to_string()),
                     ..Default::default()
                 });
             Ok(())
@@ -737,6 +771,7 @@ mod tests {
                 max_leases: 100,
                 lease_duration_ms: 1000,
                 poll_interval_ms: 1,
+                initial_position: InitialPosition::default(),
             },
         );
 
@@ -778,6 +813,7 @@ mod tests {
                 max_leases: 100,
                 lease_duration_ms: 1000,
                 poll_interval_ms: 1,
+                initial_position: InitialPosition::default(),
             },
         );
         fleet.run_until_complete(10).await.unwrap();
@@ -840,6 +876,7 @@ mod tests {
                 max_leases: 100,
                 lease_duration_ms: 100_000,
                 poll_interval_ms: 1,
+                initial_position: InitialPosition::default(),
             },
         );
 
@@ -907,6 +944,7 @@ mod tests {
                 max_leases: 100,
                 lease_duration_ms: 100_000,
                 poll_interval_ms: 1,
+                initial_position: InitialPosition::default(),
             },
         );
 
@@ -972,6 +1010,7 @@ mod tests {
                 max_leases: 100,
                 lease_duration_ms: 1000,
                 poll_interval_ms: 1,
+                initial_position: InitialPosition::default(),
             },
         );
 
@@ -1084,6 +1123,7 @@ mod tests {
                 max_leases: 100,
                 lease_duration_ms: 1000,
                 poll_interval_ms: 1,
+                initial_position: InitialPosition::default(),
             },
         );
 
@@ -1141,6 +1181,7 @@ mod tests {
                 max_leases: 100,
                 lease_duration_ms: 1000,
                 poll_interval_ms: 1,
+                initial_position: InitialPosition::default(),
             },
         );
         fleet.run_until_complete(10).await.unwrap();
@@ -1245,6 +1286,7 @@ mod tests {
                 max_leases: 100,
                 lease_duration_ms: 1000,
                 poll_interval_ms: 1,
+                initial_position: InitialPosition::default(),
             },
         );
         fleet.run_until_complete(10).await.unwrap();
@@ -1340,6 +1382,7 @@ mod tests {
                 max_leases: 100,
                 lease_duration_ms: 1000,
                 poll_interval_ms: 1,
+                initial_position: InitialPosition::default(),
             },
         )
         .with_metrics(sink.clone());

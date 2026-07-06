@@ -82,6 +82,7 @@ class Worker:
         lease_duration_ms: Optional[int] = None,
         poll_interval_ms: Optional[int] = None,
         cycle_interval_ms: Optional[int] = None,
+        initial_position: Optional[str] = None,
         sidecar_path: Optional[str] = None,
         sidecar_cmd: Optional[Sequence[str]] = None,
     ) -> None:
@@ -99,6 +100,7 @@ class Worker:
         self.lease_duration_ms = lease_duration_ms
         self.poll_interval_ms = poll_interval_ms
         self.cycle_interval_ms = cycle_interval_ms
+        self.initial_position = initial_position
         # sidecar_cmd overrides everything (tests / custom launch); otherwise the
         # resolved single binary.
         self._cmd = list(sidecar_cmd) if sidecar_cmd else [sidecar_path or _discover_sidecar()]
@@ -121,6 +123,8 @@ class Worker:
         ]:
             if val is not None:
                 env[key] = str(val)
+        if self.initial_position is not None:
+            env["DDB_STREAMS_CONSUMER_INITIAL_POSITION"] = str(self.initial_position).strip().upper()
         return env
 
     def _send(self, msg: dict[str, Any]) -> None:

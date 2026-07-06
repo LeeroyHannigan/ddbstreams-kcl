@@ -208,6 +208,7 @@ async fn run_fleet(
             max_leases: 100,
             lease_duration_ms: 60_000,
             poll_interval_ms: 100,
+            initial_position: Default::default(),
         },
     );
 

@@ -22,6 +22,8 @@ export interface WorkerConfig {
   leaseDurationMs?: number;
   pollIntervalMs?: number;
   cycleIntervalMs?: number;
+  /** Where to start reading a shard with no checkpoint: 'TRIM_HORIZON' (default) or 'LATEST'. */
+  initialPosition?: string;
   /** Explicit sidecar binary path (overrides discovery). */
   sidecarPath?: string;
   /** Full launch argv (tests / custom launch; overrides discovery). */
@@ -61,6 +63,7 @@ export class Worker {
     if (c.leaseDurationMs != null) env.DDB_STREAMS_CONSUMER_LEASE_DURATION_MS = String(c.leaseDurationMs);
     if (c.pollIntervalMs != null) env.DDB_STREAMS_CONSUMER_POLL_INTERVAL_MS = String(c.pollIntervalMs);
     if (c.cycleIntervalMs != null) env.DDB_STREAMS_CONSUMER_CYCLE_INTERVAL_MS = String(c.cycleIntervalMs);
+    if (c.initialPosition != null) env.DDB_STREAMS_CONSUMER_INITIAL_POSITION = String(c.initialPosition).trim().toUpperCase();
     return env;
   }
 

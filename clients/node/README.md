@@ -84,6 +84,25 @@ new Worker({
 Numbers stay strings in both modes to avoid precision loss. This is a
 client-side presentation choice — the wire protocol is unchanged.
 
+## Start position
+
+For a shard with no stored checkpoint, `initialPosition` controls where reading
+begins:
+
+- `'TRIM_HORIZON'` (default) — start at the oldest available record in the shard.
+- `'LATEST'` — start at the most recent records, skipping existing backlog.
+
+The value is normalized to uppercase before being passed to the sidecar. Once a
+shard has a checkpoint, the consumer always resumes from it and this setting no
+longer applies.
+
+```js
+new Worker({
+  // ...
+  initialPosition: 'LATEST', // default is 'TRIM_HORIZON'
+});
+```
+
 ## TypeScript
 
 The client is written in TypeScript; the published package ships compiled

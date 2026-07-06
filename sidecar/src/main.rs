@@ -15,6 +15,8 @@
 //!   DDB_STREAMS_CONSUMER_LEASE_DURATION_MS   lease expiry (default 10000)
 //!   DDB_STREAMS_CONSUMER_POLL_INTERVAL_MS    per-shard idle poll backoff (default 1000)
 //!   DDB_STREAMS_CONSUMER_CYCLE_INTERVAL_MS   sleep between coordination cycles (default 1000)
+//!   DDB_STREAMS_CONSUMER_INITIAL_POSITION    start position for freshly-seeded
+//!                                            shards: TRIM_HORIZON (default) or LATEST
 //!   AWS_REGION / standard AWS env  used by the SDK for creds + region
 
 mod ipc;
@@ -22,6 +24,7 @@ mod ipc;
 mod otel;
 
 use amazon_dynamodb_streams_consumer_core::coordinator::LeaseCoordinator;
+use amazon_dynamodb_streams_consumer_core::InitialPosition;
 use amazon_dynamodb_streams_consumer_lease::dynamodb::DynamoDbLeaseStore;
 use amazon_dynamodb_streams_consumer_source::aws::DdbStreamsSource;
 use amazon_dynamodb_streams_consumer_worker::fleet::{Fleet, FleetConfig, Leadership};
@@ -37,6 +40,7 @@ struct Config {
     lease_duration_ms: u64,
     poll_interval_ms: u64,
     cycle_interval_ms: u64,
+    initial_position: InitialPosition,
 }
 
 impl Config {
@@ -52,6 +56,11 @@ impl Config {
             let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "host".into());
             format!("{host}:{}", std::process::id())
         });
+        let initial_position = match std::env::var("DDB_STREAMS_CONSUMER_INITIAL_POSITION") {
+            Ok(v) => InitialPosition::parse(&v)
+                .ok_or_else(|| format!("invalid DDB_STREAMS_CONSUMER_INITIAL_POSITION: {v}"))?,
+            Err(_) => InitialPosition::default(),
+        };
         Ok(Self {
             stream_arn: req("DDB_STREAMS_CONSUMER_STREAM_ARN")?,
             lease_table: req("DDB_STREAMS_CONSUMER_LEASE_TABLE")?,
@@ -60,6 +69,7 @@ impl Config {
             lease_duration_ms: opt_u64("DDB_STREAMS_CONSUMER_LEASE_DURATION_MS", 10_000),
             poll_interval_ms: opt_u64("DDB_STREAMS_CONSUMER_POLL_INTERVAL_MS", 1_000),
             cycle_interval_ms: opt_u64("DDB_STREAMS_CONSUMER_CYCLE_INTERVAL_MS", 1_000),
+            initial_position,
         })
     }
 }
@@ -108,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             max_leases: cfg.max_leases,
             lease_duration_ms: cfg.lease_duration_ms,
             poll_interval_ms: cfg.poll_interval_ms,
+            initial_position: cfg.initial_position,
         },
     );
 
@@ -196,6 +207,7 @@ mod tests {
         "DDB_STREAMS_CONSUMER_LEASE_DURATION_MS",
         "DDB_STREAMS_CONSUMER_POLL_INTERVAL_MS",
         "DDB_STREAMS_CONSUMER_CYCLE_INTERVAL_MS",
+        "DDB_STREAMS_CONSUMER_INITIAL_POSITION",
         "HOSTNAME",
     ];
 

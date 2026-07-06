@@ -36,6 +36,14 @@ public sealed class WorkerConfig
     /// <summary>Coordination cycle interval in milliseconds. Optional.</summary>
     public long? CycleIntervalMs { get; set; }
 
+    /// <summary>
+    /// Where to start reading a shard that has no checkpoint. Optional.
+    /// Allowed values: <c>TRIM_HORIZON</c> (default) reads from the oldest
+    /// available record; <c>LATEST</c> reads only records written after the
+    /// worker starts. Case-insensitive.
+    /// </summary>
+    public string? InitialPosition { get; set; }
+
     /// <summary>Explicit sidecar binary path (overrides discovery). Optional.</summary>
     public string? SidecarPath { get; set; }
 
@@ -238,6 +246,10 @@ public sealed class Worker
         if (_config.CycleIntervalMs is { } ci)
         {
             e["DDB_STREAMS_CONSUMER_CYCLE_INTERVAL_MS"] = ci.ToString();
+        }
+        if (_config.InitialPosition is { } ip)
+        {
+            e["DDB_STREAMS_CONSUMER_INITIAL_POSITION"] = ip.Trim().ToUpperInvariant();
         }
     }
 

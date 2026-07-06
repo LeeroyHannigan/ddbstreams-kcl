@@ -91,8 +91,13 @@ impl AsyncLeaseStore for DynamoDbLeaseStore {
             .await
             .map_err(box_lease)
     }
-    async fn create_shard_lease(&self, key: &str, parents: &[String]) -> Result<(), WorkerError> {
-        DynamoDbLeaseStore::create_shard_lease(self, key, parents)
+    async fn create_shard_lease(
+        &self,
+        key: &str,
+        parents: &[String],
+        checkpoint: Option<&str>,
+    ) -> Result<(), WorkerError> {
+        DynamoDbLeaseStore::create_shard_lease(self, key, parents, checkpoint)
             .await
             .map_err(box_lease)
     }

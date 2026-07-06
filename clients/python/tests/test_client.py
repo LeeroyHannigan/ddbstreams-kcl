@@ -115,6 +115,7 @@ class TestWorkerEdgeCases(unittest.TestCase):
             stream_arn="the-arn", lease_table="the-table", processor=_MinimalProcessor(),
             owner="own", region="eu-west-1", max_leases=7,
             lease_duration_ms=1234, poll_interval_ms=55, cycle_interval_ms=66,
+            initial_position="latest",
             sidecar_cmd=["true"],
         )
         env = w._env()
@@ -126,6 +127,15 @@ class TestWorkerEdgeCases(unittest.TestCase):
         self.assertEqual(env["DDB_STREAMS_CONSUMER_LEASE_DURATION_MS"], "1234")
         self.assertEqual(env["DDB_STREAMS_CONSUMER_POLL_INTERVAL_MS"], "55")
         self.assertEqual(env["DDB_STREAMS_CONSUMER_CYCLE_INTERVAL_MS"], "66")
+        # case-insensitive input is normalized to uppercase
+        self.assertEqual(env["DDB_STREAMS_CONSUMER_INITIAL_POSITION"], "LATEST")
+
+    def test_env_omits_initial_position_when_unset(self):
+        w = Worker(
+            stream_arn="the-arn", lease_table="the-table", processor=_MinimalProcessor(),
+            sidecar_cmd=["true"],
+        )
+        self.assertNotIn("DDB_STREAMS_CONSUMER_INITIAL_POSITION", w._env())
 
     def test_missing_sidecar_binary_raises(self):
         import os as _os

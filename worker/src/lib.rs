@@ -97,10 +97,15 @@ pub trait AsyncLeaseStore {
     /// lease is left untouched). Called ONLY by the shard-sync leader: it is how
     /// the leader shares a discovered shard (and its lineage) with the fleet so
     /// non-leaders never call DescribeStream. See [`crate::fleet`] / core `leader`.
+    /// `checkpoint` is the initial resume position to persist on the new lease
+    /// (`None` = TRIM_HORIZON; a sentinel encodes another start mode — see
+    /// core `StartPosition`). Applied only at create; an existing lease is
+    /// left untouched.
     async fn create_shard_lease(
         &self,
         lease_key: &str,
         parents: &[ShardId],
+        checkpoint: Option<&str>,
     ) -> Result<(), WorkerError>;
 
     /// Optimistic bid for the leader lease.
@@ -430,13 +435,14 @@ mod tests {
             &self,
             key: &str,
             parents: &[ShardId],
+            checkpoint: Option<&str>,
         ) -> Result<(), WorkerError> {
             let mut rows = self.rows.lock().unwrap();
             rows.entry(key.to_string())
                 .or_insert_with(|| FakeLeaseState {
                     owner: None,
                     counter: 0,
-                    checkpoint: None,
+                    checkpoint: checkpoint.map(|s| s.to_string()),
                     completed: false,
                     parents: parents.to_vec(),
                 });

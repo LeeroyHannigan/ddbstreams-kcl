@@ -116,6 +116,25 @@ This requires `software.amazon.awssdk:dynamodb` on the classpath. It is a
 **`provided`** dependency of this client, so `native`/`ddb_json` users are not
 forced to pull the AWS SDK; apps using `SDK` already have it.
 
+## Start position
+
+When a shard has no stored checkpoint yet, `initialPosition(...)` controls where
+consumption begins:
+
+- `TRIM_HORIZON` (default) — start at the oldest available record in the shard.
+- `LATEST` — start at the newest records, skipping existing backlog.
+
+The value is case-insensitive (normalized to uppercase). Once a checkpoint
+exists for a shard, resume always continues from the checkpoint regardless of
+this setting.
+
+```java
+WorkerConfig.builder()
+    // ...
+    .initialPosition("LATEST") // default is TRIM_HORIZON
+    .build();
+```
+
 ## Testing
 
 ```bash
