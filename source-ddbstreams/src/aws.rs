@@ -261,17 +261,21 @@ impl DdbStreamsSource {
             },
         };
 
-        // 2) GetRecords, self-healing an expired/trimmed threaded iterator once.
-        let resp = match self
-            .client
-            .get_records()
-            .shard_iterator(&iterator)
-            .send()
-            .await
+        // 2) GetRecords, self-healing an expired/trimmed threaded iterator once,
+        //    and retrying transient throttling with bounded backoff.
+        let resp = match with_throttle_retry(|| async {
+            self.client
+                .get_records()
+                .shard_iterator(&iterator)
+                .send()
+                .await
+                .map_err(|e| -> BoxError { e.into() })
+        })
+        .await
         {
             Ok(r) => r,
             Err(e) => {
-                let be: BoxError = e.into();
+                let be: BoxError = e;
                 if is_recoverable(&be) {
                     // The (possibly cached) iterator expired → drop it and
                     // re-derive from the checkpoint, retrying once.
@@ -365,6 +369,38 @@ fn is_recoverable(e: &BoxError) -> bool {
     msg.contains("TrimmedDataAccessException")
         || msg.contains("ExpiredIteratorException")
         || msg.contains("ResourceNotFoundException")
+}
+
+/// DynamoDB Streams throttling / capacity errors — retryable with backoff
+/// (DDB Streams meters `GetRecords` to ~4 calls/s/shard).
+fn is_throttling(e: &BoxError) -> bool {
+    let msg = e.to_string();
+    msg.contains("ProvisionedThroughputExceededException")
+        || msg.contains("ThrottlingException")
+        || msg.contains("RequestLimitExceeded")
+        || msg.contains("LimitExceededException")
+}
+
+/// Run a `GetRecords` send, retrying only on throttling with capped exponential
+/// backoff (~100ms→800ms, 5 attempts). Non-throttle errors (including the
+/// recoverable expired/trimmed cases) return immediately for the caller's
+/// self-heal path.
+async fn with_throttle_retry<T, F, Fut>(mut op: F) -> Result<T, BoxError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, BoxError>>,
+{
+    let mut delay_ms = 100u64;
+    for attempt in 0..5 {
+        match op().await {
+            Err(e) if is_throttling(&e) && attempt < 4 => {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                delay_ms = (delay_ms * 2).min(800);
+            }
+            other => return other,
+        }
+    }
+    unreachable!("loop returns on the final attempt")
 }
 
 #[cfg(test)]

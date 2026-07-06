@@ -91,6 +91,11 @@ impl AsyncLeaseStore for DynamoDbLeaseStore {
             .await
             .map_err(box_lease)
     }
+    async fn delete_lease(&self, key: &str) -> Result<(), WorkerError> {
+        DynamoDbLeaseStore::delete_lease(self, key)
+            .await
+            .map_err(box_lease)
+    }
     async fn create_shard_lease(
         &self,
         key: &str,

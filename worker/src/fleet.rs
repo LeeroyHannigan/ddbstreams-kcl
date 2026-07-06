@@ -14,10 +14,13 @@ use crate::{
     eligible, AsyncLeaseStore, AsyncShardConsumer, AsyncStreamSource, ShardConsumerFactory,
     WorkerError,
 };
+use amazon_dynamodb_streams_consumer_core::cleanup::{leases_safe_to_delete, LeaseState};
 use amazon_dynamodb_streams_consumer_core::coordinator::{LeaseCoordinator, RawLease};
 use amazon_dynamodb_streams_consumer_core::leader::{shard_metas_from_leases, LEADER_LEASE_KEY};
 use amazon_dynamodb_streams_consumer_core::metrics::{noop_sink, ShardMetrics, SharedMetricsSink};
-use amazon_dynamodb_streams_consumer_core::{child_seed_checkpoint, InitialPosition, ShardId};
+use amazon_dynamodb_streams_consumer_core::{
+    child_seed_checkpoint, InitialPosition, ShardId, StartPosition,
+};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -222,6 +225,10 @@ where
         let rows = self.leases.list().await?;
         if leadership.step(&*self.leases, &rows, now_ms).await {
             self.leader_shard_sync(&rows).await?;
+            // Leader-only: GC completed parent leases whose children are safely
+            // processing, so the lease table doesn't grow without bound on a
+            // long-running resharding stream.
+            self.cleanup_completed_leases(&rows).await;
         }
 
         // 1) Decide + claim this worker's share (sentinel lease excluded from
@@ -267,6 +274,9 @@ where
         if !shards.is_empty() && shards.iter().all(|m| completed.contains(&m.id)) {
             return Ok(true);
         }
+        // Shard ids that currently have a lease row. A parent absent here has
+        // been GC'd (see cleanup pass) and counts as satisfied for its children.
+        let existing: HashSet<ShardId> = shards.iter().map(|m| m.id.clone()).collect();
 
         // 3) Run one concurrent task per owned + eligible shard.
         let mut set: JoinSet<()> = JoinSet::new();
@@ -274,7 +284,7 @@ where
             let Some((counter, checkpoint)) = owned.get(&meta.id).cloned() else {
                 continue;
             };
-            if !eligible(meta, &completed) {
+            if !eligible(meta, &completed, &existing) {
                 continue;
             }
             let src = self.source.clone();
@@ -406,6 +416,40 @@ where
             }
         }
         Ok(())
+    }
+
+    /// Leader-only: delete completed parent leases that are safe to GC.
+    ///
+    /// A completed shard's lease is deleted only once every child lease exists
+    /// and is itself processing or completed (core [`leases_safe_to_delete`]),
+    /// so lineage is never rediscovered/replayed and no in-flight child is
+    /// stranded ([`eligible`] treats a missing parent as satisfied). Best-effort
+    /// per lease; the conditional delete no-ops if the row isn't completed.
+    async fn cleanup_completed_leases(&self, rows: &[RawLease]) {
+        let shards = shard_metas_from_leases(rows);
+        let state: std::collections::HashMap<String, LeaseState> = rows
+            .iter()
+            .filter(|r| r.lease_key != LEADER_LEASE_KEY)
+            .map(|r| {
+                // "processing" = a real record was checkpointed (past a start
+                // sentinel) or the shard completed.
+                let processing = r.completed
+                    || matches!(
+                        StartPosition::from_checkpoint(r.checkpoint.as_deref()),
+                        StartPosition::After(_)
+                    );
+                (
+                    r.lease_key.clone(),
+                    LeaseState {
+                        completed: r.completed,
+                        processing,
+                    },
+                )
+            })
+            .collect();
+        for key in leases_safe_to_delete(&shards, &state) {
+            let _ = self.leases.delete_lease(&key).await;
+        }
     }
 
     /// Release every lease this worker currently owns (graceful shutdown), so
@@ -577,9 +621,9 @@ mod tests {
         checkpoint: Option<String>,
         parents: Vec<String>,
     }
-    #[derive(Default)]
+    #[derive(Default, Clone)]
     struct FakeLeases {
-        rows: Mutex<HashMap<String, State>>,
+        rows: Arc<Mutex<HashMap<String, State>>>,
     }
     #[async_trait::async_trait]
     impl AsyncLeaseStore for FakeLeases {
@@ -648,6 +692,13 @@ mod tests {
             let r = rows.get_mut(key).ok_or("no lease")?;
             r.owner = None;
             r.counter = counter + 1;
+            Ok(())
+        }
+        async fn delete_lease(&self, key: &str) -> Result<(), WorkerError> {
+            let mut rows = self.rows.lock().unwrap();
+            if rows.get(key).map(|r| r.completed).unwrap_or(false) {
+                rows.remove(key);
+            }
             Ok(())
         }
         async fn create_shard_lease(
@@ -735,6 +786,120 @@ mod tests {
         fn shard_ended(&mut self, _s: &ShardId) {
             assert!(self.inited);
         }
+    }
+
+    #[tokio::test]
+    async fn leader_gcs_completed_parent_once_child_processing() {
+        // Seed: completed parent `p` (a real record was checkpointed) + child `c`
+        // that is actively processing (real checkpoint). The parent lease should
+        // be deleted; the child lease must remain.
+        let leases = FakeLeases::default();
+        {
+            let mut rows = leases.rows.lock().unwrap();
+            rows.insert(
+                "p".into(),
+                State {
+                    owner: None,
+                    counter: 3,
+                    completed: true,
+                    checkpoint: Some("100000000000000000000000001".into()),
+                    parents: vec![],
+                },
+            );
+            rows.insert(
+                "c".into(),
+                State {
+                    owner: Some("w1".into()),
+                    counter: 1,
+                    completed: false,
+                    checkpoint: Some("100000000000000000000000009".into()),
+                    parents: vec!["p".into()],
+                },
+            );
+        }
+        let source = FakeSource {
+            metas: vec![],
+            data: HashMap::new(),
+        };
+        let sink: Sink = Arc::new(Mutex::new(HashMap::new()));
+        let fleet = Fleet::new(
+            source,
+            leases.clone(),
+            Arc::new(SyncConsumerFactory::new(Arc::new(RecordingFactory {
+                sink,
+            }))),
+            FleetConfig {
+                owner: "w1".into(),
+                max_leases: 100,
+                lease_duration_ms: 1000,
+                poll_interval_ms: 1,
+                initial_position: InitialPosition::default(),
+            },
+        );
+
+        let rows = fleet.leases.list().await.unwrap();
+        fleet.cleanup_completed_leases(&rows).await;
+
+        let after = leases.rows.lock().unwrap();
+        assert!(
+            !after.contains_key("p"),
+            "completed parent lease should be GC'd"
+        );
+        assert!(
+            after.contains_key("c"),
+            "processing child lease must remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn leader_retains_completed_parent_while_child_not_started() {
+        // Child exists but has NOT processed yet (still at a start position /
+        // no real checkpoint) → parent must be retained as a tombstone.
+        let leases = FakeLeases::default();
+        {
+            let mut rows = leases.rows.lock().unwrap();
+            rows.insert(
+                "p".into(),
+                State {
+                    completed: true,
+                    checkpoint: Some("100000000000000000000000001".into()),
+                    ..Default::default()
+                },
+            );
+            rows.insert(
+                "c".into(),
+                State {
+                    checkpoint: None, // never processed a record
+                    parents: vec!["p".into()],
+                    ..Default::default()
+                },
+            );
+        }
+        let fleet = Fleet::new(
+            FakeSource {
+                metas: vec![],
+                data: HashMap::new(),
+            },
+            leases.clone(),
+            Arc::new(SyncConsumerFactory::new(Arc::new(RecordingFactory {
+                sink: Arc::new(Mutex::new(HashMap::new())),
+            }))),
+            FleetConfig {
+                owner: "w1".into(),
+                max_leases: 100,
+                lease_duration_ms: 1000,
+                poll_interval_ms: 1,
+                initial_position: InitialPosition::default(),
+            },
+        );
+        let rows = fleet.leases.list().await.unwrap();
+        fleet.cleanup_completed_leases(&rows).await;
+        let after = leases.rows.lock().unwrap();
+        assert!(
+            after.contains_key("p"),
+            "parent retained until child processes"
+        );
+        assert!(after.contains_key("c"));
     }
 
     #[tokio::test]

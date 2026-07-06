@@ -92,6 +92,12 @@ pub trait AsyncLeaseStore {
     /// take it immediately on graceful shutdown. Conditional on ownership.
     async fn release(&self, lease_key: &str, owner: &str, counter: u64) -> Result<(), WorkerError>;
 
+    /// Delete a completed shard's lease (tombstone GC). Implementations MUST
+    /// only delete a lease still marked completed. Called only by the shard-sync
+    /// leader after a shard's children are safely processing (see core
+    /// `leases_safe_to_delete`).
+    async fn delete_lease(&self, lease_key: &str) -> Result<(), WorkerError>;
+
     /// Publish a shard as an **unowned** lease carrying its `parents`, if it does
     /// not already exist (idempotent create-if-absent — an existing/in-progress
     /// lease is left untouched). Called ONLY by the shard-sync leader: it is how
@@ -246,8 +252,11 @@ impl<S: AsyncStreamSource, L: AsyncLeaseStore> Worker<S, L> {
         }
 
         let mut progressed = false;
+        // Shard ids present this cycle (offline: the full source shard list, so a
+        // parent is always present — the missing-parent GC case is live-only).
+        let existing: HashSet<ShardId> = shards.iter().map(|m| m.id.clone()).collect();
         for meta in &shards {
-            if !eligible(meta, &completed) {
+            if !eligible(meta, &completed, &existing) {
                 continue;
             }
             progressed = true;
@@ -296,8 +305,16 @@ impl<S: AsyncStreamSource, L: AsyncLeaseStore> Worker<S, L> {
 
 /// Parent-before-child: eligible iff not already complete and every parent's
 /// lease is complete.
-fn eligible(meta: &ShardMeta, completed: &HashSet<ShardId>) -> bool {
-    !completed.contains(&meta.id) && meta.parents.iter().all(|p| completed.contains(p))
+fn eligible(meta: &ShardMeta, completed: &HashSet<ShardId>, existing: &HashSet<ShardId>) -> bool {
+    // A parent gate is satisfied if the parent is complete OR its lease no longer
+    // exists — a lease is only deleted (see core `leases_safe_to_delete`) once its
+    // children are safely processing, so a missing parent is definitionally done.
+    // Without this, GC-ing a completed parent would strand an in-flight child.
+    !completed.contains(&meta.id)
+        && meta
+            .parents
+            .iter()
+            .all(|p| completed.contains(p) || !existing.contains(p))
 }
 
 #[cfg(test)]
@@ -306,6 +323,46 @@ mod tests {
     use amazon_dynamodb_streams_consumer_core::Record;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    fn shard(id: &str, parents: &[&str]) -> ShardMeta {
+        ShardMeta {
+            id: id.into(),
+            parents: parents.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+    fn set(items: &[&str]) -> HashSet<ShardId> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn eligible_gates_child_until_parent_complete() {
+        let child = shard("c", &["p"]);
+        let existing = set(&["p", "c"]);
+        // Parent present but not complete → child gated.
+        assert!(!eligible(&child, &set(&[]), &existing));
+        // Parent complete → child eligible.
+        assert!(eligible(&child, &set(&["p"]), &existing));
+    }
+
+    #[test]
+    fn eligible_treats_gcd_parent_as_satisfied() {
+        // Parent lease has been deleted (absent from `existing`) and is not in
+        // the completed set either. A cleaned-up parent must NOT strand its
+        // in-flight child — the child stays eligible.
+        let child = shard("c", &["p"]);
+        let existing = set(&["c"]); // "p" GC'd
+        assert!(eligible(&child, &set(&[]), &existing));
+    }
+
+    #[test]
+    fn eligible_merge_child_needs_all_parents_satisfied() {
+        let child = shard("c", &["p1", "p2"]);
+        let existing = set(&["p1", "p2", "c"]);
+        // Only one parent complete → gated.
+        assert!(!eligible(&child, &set(&["p1"]), &existing));
+        // p1 complete, p2 GC'd (absent) → satisfied.
+        assert!(eligible(&child, &set(&["p1"]), &set(&["p2_absent", "c"])));
+    }
 
     fn rec(shard: &str, seq: &str) -> Record {
         Record {
@@ -429,6 +486,13 @@ mod tests {
             let r = rows.get_mut(key).ok_or("no lease")?;
             r.owner = None;
             r.counter = counter + 1;
+            Ok(())
+        }
+        async fn delete_lease(&self, key: &str) -> Result<(), WorkerError> {
+            let mut rows = self.rows.lock().unwrap();
+            if rows.get(key).map(|r| r.completed).unwrap_or(false) {
+                rows.remove(key);
+            }
             Ok(())
         }
         async fn create_shard_lease(

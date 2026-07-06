@@ -28,12 +28,15 @@ const PARENTS: &str = "parentShardIds";
 pub enum LeaseError {
     /// The optimistic-lock condition failed — another worker owns/advanced it.
     Lost,
+    /// A throttling/capacity error (retryable with backoff).
+    Throttled(BoxError),
     Aws(BoxError),
 }
 impl std::fmt::Display for LeaseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LeaseError::Lost => write!(f, "lease lost (conditional check failed)"),
+            LeaseError::Throttled(e) => write!(f, "throttled: {e}"),
             LeaseError::Aws(e) => write!(f, "aws error: {e}"),
         }
     }
@@ -41,6 +44,13 @@ impl std::fmt::Display for LeaseError {
 impl std::error::Error for LeaseError {}
 
 const CONDITIONAL_CHECK_FAILED: &str = "ConditionalCheckFailedException";
+// DynamoDB throttling / capacity error codes — retryable with backoff.
+const THROTTLE_CODES: &[&str] = &[
+    "ProvisionedThroughputExceededException",
+    "ThrottlingException",
+    "RequestLimitExceeded",
+    "LimitExceededException",
+];
 
 pub struct DynamoDbLeaseStore {
     client: Client,
@@ -217,22 +227,25 @@ impl DynamoDbLeaseStore {
         owner: &str,
         counter: u64,
     ) -> Result<u64, LeaseError> {
-        let r = self
-            .client
-            .update_item()
-            .table_name(&self.table)
-            .key(LEASE_KEY, AttributeValue::S(lease_key.to_string()))
-            .update_expression("SET leaseCounter = leaseCounter + :one")
-            .condition_expression("leaseCounter = :c AND leaseOwner = :o")
-            .expression_attribute_values(":one", AttributeValue::N("1".into()))
-            .expression_attribute_values(":c", AttributeValue::N(counter.to_string()))
-            .expression_attribute_values(":o", AttributeValue::S(owner.to_string()))
-            .send()
-            .await;
-        match r {
-            Ok(_) => Ok(counter + 1),
-            Err(e) => Err(classify(e)),
-        }
+        with_throttle_retry(|| async {
+            let r = self
+                .client
+                .update_item()
+                .table_name(&self.table)
+                .key(LEASE_KEY, AttributeValue::S(lease_key.to_string()))
+                .update_expression("SET leaseCounter = leaseCounter + :one")
+                .condition_expression("leaseCounter = :c AND leaseOwner = :o")
+                .expression_attribute_values(":one", AttributeValue::N("1".into()))
+                .expression_attribute_values(":c", AttributeValue::N(counter.to_string()))
+                .expression_attribute_values(":o", AttributeValue::S(owner.to_string()))
+                .send()
+                .await;
+            match r {
+                Ok(_) => Ok(counter + 1),
+                Err(e) => Err(classify(e)),
+            }
+        })
+        .await
     }
 
     /// Persist an opaque checkpoint and bump the counter, conditioned on
@@ -244,23 +257,26 @@ impl DynamoDbLeaseStore {
         counter: u64,
         seq: &str,
     ) -> Result<u64, LeaseError> {
-        let r = self
-            .client
-            .update_item()
-            .table_name(&self.table)
-            .key(LEASE_KEY, AttributeValue::S(lease_key.to_string()))
-            .update_expression("SET checkpoint = :cp, leaseCounter = leaseCounter + :one")
-            .condition_expression("leaseCounter = :c AND leaseOwner = :o")
-            .expression_attribute_values(":cp", AttributeValue::S(seq.to_string()))
-            .expression_attribute_values(":one", AttributeValue::N("1".into()))
-            .expression_attribute_values(":c", AttributeValue::N(counter.to_string()))
-            .expression_attribute_values(":o", AttributeValue::S(owner.to_string()))
-            .send()
-            .await;
-        match r {
-            Ok(_) => Ok(counter + 1),
-            Err(e) => Err(classify(e)),
-        }
+        with_throttle_retry(|| async {
+            let r = self
+                .client
+                .update_item()
+                .table_name(&self.table)
+                .key(LEASE_KEY, AttributeValue::S(lease_key.to_string()))
+                .update_expression("SET checkpoint = :cp, leaseCounter = leaseCounter + :one")
+                .condition_expression("leaseCounter = :c AND leaseOwner = :o")
+                .expression_attribute_values(":cp", AttributeValue::S(seq.to_string()))
+                .expression_attribute_values(":one", AttributeValue::N("1".into()))
+                .expression_attribute_values(":c", AttributeValue::N(counter.to_string()))
+                .expression_attribute_values(":o", AttributeValue::S(owner.to_string()))
+                .send()
+                .await;
+            match r {
+                Ok(_) => Ok(counter + 1),
+                Err(e) => Err(classify(e)),
+            }
+        })
+        .await
     }
 
     /// Mark the shard fully processed (SHARD_END), conditioned on ownership.
@@ -280,6 +296,27 @@ impl DynamoDbLeaseStore {
             .expression_attribute_values(":t", AttributeValue::Bool(true))
             .expression_attribute_values(":c", AttributeValue::N(counter.to_string()))
             .expression_attribute_values(":o", AttributeValue::S(owner.to_string()))
+            .send()
+            .await;
+        match r {
+            Ok(_) => Ok(()),
+            Err(e) => Err(classify(e)),
+        }
+    }
+
+    /// Delete a completed shard's lease (SHARD_END tombstone GC). Conditioned on
+    /// `completed = true` so a still-active or resurrected lease is never
+    /// removed. A `LeaseError::Lost` means the condition failed (not completed /
+    /// already gone) — harmless; the caller skips it. Mirrors KCL
+    /// `LeaseCleanupManager.cleanupLeaseForCompletedShard`.
+    pub async fn delete_lease(&self, lease_key: &str) -> Result<(), LeaseError> {
+        let r = self
+            .client
+            .delete_item()
+            .table_name(&self.table)
+            .key(LEASE_KEY, AttributeValue::S(lease_key.to_string()))
+            .condition_expression("attribute_exists(leaseKey) AND completed = :t")
+            .expression_attribute_values(":t", AttributeValue::Bool(true))
             .send()
             .await;
         match r {
@@ -416,9 +453,37 @@ where
 {
     if e.code() == Some(CONDITIONAL_CHECK_FAILED) {
         LeaseError::Lost
+    } else if e
+        .code()
+        .map(|c| THROTTLE_CODES.contains(&c))
+        .unwrap_or(false)
+    {
+        LeaseError::Throttled(Box::new(e))
     } else {
         LeaseError::Aws(Box::new(e))
     }
+}
+
+/// Run a fallible lease op, retrying only on `Throttled` with capped exponential
+/// backoff (~50ms→800ms, 5 attempts). `Lost` and other `Aws` errors return
+/// immediately — a throttle must not be mistaken for lease loss (which would
+/// drop the shard and cause needless failover churn).
+async fn with_throttle_retry<T, F, Fut>(mut op: F) -> Result<T, LeaseError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, LeaseError>>,
+{
+    let mut delay_ms = 50u64;
+    for attempt in 0..5 {
+        match op().await {
+            Err(LeaseError::Throttled(_)) if attempt < 4 => {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                delay_ms = (delay_ms * 2).min(800);
+            }
+            other => return other,
+        }
+    }
+    unreachable!("loop returns on the final attempt")
 }
 
 fn item_to_lease(item: &HashMap<String, AttributeValue>) -> Lease {
@@ -447,5 +512,62 @@ fn item_to_lease(item: &HashMap<String, AttributeValue>) -> Lease {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn throttle_retry_succeeds_after_transient_throttles() {
+        let calls = Cell::new(0);
+        let out: Result<u32, LeaseError> = rt().block_on(with_throttle_retry(|| {
+            let n = calls.get() + 1;
+            calls.set(n);
+            async move {
+                if n < 3 {
+                    Err(LeaseError::Throttled("throttled".into()))
+                } else {
+                    Ok(42)
+                }
+            }
+        }));
+        assert_eq!(out.unwrap(), 42);
+        assert_eq!(calls.get(), 3, "retried through the transient throttles");
+    }
+
+    #[test]
+    fn throttle_retry_does_not_retry_lost() {
+        let calls = Cell::new(0);
+        let out: Result<u32, LeaseError> = rt().block_on(with_throttle_retry(|| {
+            calls.set(calls.get() + 1);
+            async { Err::<u32, _>(LeaseError::Lost) }
+        }));
+        assert!(matches!(out, Err(LeaseError::Lost)));
+        assert_eq!(
+            calls.get(),
+            1,
+            "a lost lease must never be retried as throttling"
+        );
+    }
+
+    #[test]
+    fn throttle_retry_gives_up_after_max_attempts() {
+        let calls = Cell::new(0);
+        let out: Result<u32, LeaseError> = rt().block_on(with_throttle_retry(|| {
+            calls.set(calls.get() + 1);
+            async { Err::<u32, _>(LeaseError::Throttled("throttled".into())) }
+        }));
+        assert!(matches!(out, Err(LeaseError::Throttled(_))));
+        assert_eq!(calls.get(), 5, "bounded at 5 attempts");
     }
 }
