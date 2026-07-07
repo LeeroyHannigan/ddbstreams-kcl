@@ -291,8 +291,23 @@ public sealed class Worker
 
     private static void Send(StreamWriter stdin, object msg)
     {
-        stdin.Write(JsonSerializer.Serialize(msg));
-        stdin.Write('\n');
-        stdin.Flush();
+        // Best-effort: the sidecar may have already emitted its final message and
+        // exited (closing its stdin), so a write can race into a broken pipe. That
+        // is a normal shutdown, not an error — the read loop observes stdout EOF
+        // and stops. Mirrors the other clients (Python swallows BrokenPipeError).
+        try
+        {
+            stdin.Write(JsonSerializer.Serialize(msg));
+            stdin.Write('\n');
+            stdin.Flush();
+        }
+        catch (IOException)
+        {
+            // sidecar stdin already closed
+        }
+        catch (ObjectDisposedException)
+        {
+            // stdin already disposed
+        }
     }
 }
