@@ -19,6 +19,15 @@
 //!                                            shards: TRIM_HORIZON (default) or LATEST
 //!   DDB_STREAMS_CONSUMER_GRACEFUL_SHUTDOWN_MS window to let processors flush on
 //!                                            shutdown before releasing leases (default 5000)
+//!   DDB_STREAMS_CONSUMER_MAX_RECORDS         GetRecords batch-size limit 1..=1000
+//!                                            (default: service default)
+//!   DDB_STREAMS_CONSUMER_LEASE_BILLING_MODE  lease-table billing when auto-created:
+//!                                            PAY_PER_REQUEST (default) or PROVISIONED
+//!   DDB_STREAMS_CONSUMER_LEASE_READ_CAPACITY  provisioned RCUs (default 5, PROVISIONED only)
+//!   DDB_STREAMS_CONSUMER_LEASE_WRITE_CAPACITY provisioned WCUs (default 5, PROVISIONED only)
+//!   DDB_STREAMS_CONSUMER_LEASE_PITR          enable PITR on the auto-created lease
+//!                                            table (default false; needs
+//!                                            dynamodb:UpdateContinuousBackups)
 //!   AWS_REGION / standard AWS env  used by the SDK for creds + region
 
 mod ipc;
@@ -28,7 +37,9 @@ mod otel;
 use amazon_dynamodb_streams_consumer_core::coordinator::LeaseCoordinator;
 use amazon_dynamodb_streams_consumer_core::InitialPosition;
 use amazon_dynamodb_streams_consumer_core::ShardId;
-use amazon_dynamodb_streams_consumer_lease::dynamodb::DynamoDbLeaseStore;
+use amazon_dynamodb_streams_consumer_lease::dynamodb::{
+    DynamoDbLeaseStore, LeaseBilling, LeaseTableConfig,
+};
 use amazon_dynamodb_streams_consumer_source::aws::DdbStreamsSource;
 use amazon_dynamodb_streams_consumer_worker::fleet::{Fleet, FleetConfig, Leadership};
 use amazon_dynamodb_streams_consumer_worker::{AsyncLeaseStore, AsyncStreamSource, WorkerError};
@@ -112,6 +123,10 @@ struct Config {
     cycle_interval_ms: u64,
     initial_position: InitialPosition,
     graceful_shutdown_timeout_ms: u64,
+    /// Optional GetRecords batch-size limit (None = service default).
+    max_records: Option<i32>,
+    /// Billing mode + PITR applied when the lease table is auto-created.
+    lease_table_config: LeaseTableConfig,
 }
 
 impl Config {
@@ -132,6 +147,32 @@ impl Config {
                 .ok_or_else(|| format!("invalid DDB_STREAMS_CONSUMER_INITIAL_POSITION: {v}"))?,
             Err(_) => InitialPosition::default(),
         };
+        let max_records = std::env::var("DDB_STREAMS_CONSUMER_MAX_RECORDS")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok());
+        let lease_table_config = {
+            let billing = match std::env::var("DDB_STREAMS_CONSUMER_LEASE_BILLING_MODE")
+                .unwrap_or_default()
+                .to_ascii_uppercase()
+                .as_str()
+            {
+                "PROVISIONED" => LeaseBilling::Provisioned {
+                    read_capacity: opt_u64("DDB_STREAMS_CONSUMER_LEASE_READ_CAPACITY", 5) as i64,
+                    write_capacity: opt_u64("DDB_STREAMS_CONSUMER_LEASE_WRITE_CAPACITY", 5) as i64,
+                },
+                // "", "PAY_PER_REQUEST", or anything else -> on-demand default.
+                _ => LeaseBilling::PayPerRequest,
+            };
+            let pitr = std::env::var("DDB_STREAMS_CONSUMER_LEASE_PITR")
+                .map(|v| {
+                    matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false);
+            LeaseTableConfig { billing, pitr }
+        };
         Ok(Self {
             stream_arn: req("DDB_STREAMS_CONSUMER_STREAM_ARN")?,
             lease_table: req("DDB_STREAMS_CONSUMER_LEASE_TABLE")?,
@@ -145,6 +186,8 @@ impl Config {
                 "DDB_STREAMS_CONSUMER_GRACEFUL_SHUTDOWN_MS",
                 5_000,
             ),
+            max_records,
+            lease_table_config,
         })
     }
 }
@@ -164,8 +207,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // Live AWS wiring.
-    let source = DdbStreamsSource::from_env(&cfg.stream_arn).await;
-    let leases = DynamoDbLeaseStore::from_env(&cfg.lease_table).await;
+    let mut source = DdbStreamsSource::from_env(&cfg.stream_arn).await;
+    if let Some(n) = cfg.max_records {
+        source = source.with_max_records(n);
+    }
+    let leases = DynamoDbLeaseStore::from_env(&cfg.lease_table)
+        .await
+        .with_table_config(cfg.lease_table_config.clone());
     leases.ensure_table().await?;
 
     // Stdio IPC to the client.
@@ -265,7 +313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{graceful_handoff, Config, LeaseHandoff, ShutdownNotifier};
+    use super::{graceful_handoff, Config, LeaseBilling, LeaseHandoff, ShutdownNotifier};
     use amazon_dynamodb_streams_consumer_core::ShardId;
     use amazon_dynamodb_streams_consumer_worker::WorkerError;
     use std::sync::{Arc, Mutex};
@@ -283,6 +331,11 @@ mod tests {
         "DDB_STREAMS_CONSUMER_CYCLE_INTERVAL_MS",
         "DDB_STREAMS_CONSUMER_INITIAL_POSITION",
         "DDB_STREAMS_CONSUMER_GRACEFUL_SHUTDOWN_MS",
+        "DDB_STREAMS_CONSUMER_MAX_RECORDS",
+        "DDB_STREAMS_CONSUMER_LEASE_BILLING_MODE",
+        "DDB_STREAMS_CONSUMER_LEASE_READ_CAPACITY",
+        "DDB_STREAMS_CONSUMER_LEASE_WRITE_CAPACITY",
+        "DDB_STREAMS_CONSUMER_LEASE_PITR",
         "HOSTNAME",
     ];
 
@@ -319,6 +372,10 @@ mod tests {
             "owner defaults to <host>:<pid>, got {}",
             c.owner
         );
+        // Knob defaults: no explicit GetRecords limit, on-demand billing, no PITR.
+        assert_eq!(c.max_records, None);
+        assert_eq!(c.lease_table_config.billing, LeaseBilling::PayPerRequest);
+        assert!(!c.lease_table_config.pitr);
         clear();
     }
 
@@ -333,12 +390,26 @@ mod tests {
         std::env::set_var("DDB_STREAMS_CONSUMER_LEASE_DURATION_MS", "3000");
         std::env::set_var("DDB_STREAMS_CONSUMER_POLL_INTERVAL_MS", "200");
         std::env::set_var("DDB_STREAMS_CONSUMER_CYCLE_INTERVAL_MS", "250");
+        std::env::set_var("DDB_STREAMS_CONSUMER_MAX_RECORDS", "250");
+        std::env::set_var("DDB_STREAMS_CONSUMER_LEASE_BILLING_MODE", "provisioned");
+        std::env::set_var("DDB_STREAMS_CONSUMER_LEASE_READ_CAPACITY", "7");
+        std::env::set_var("DDB_STREAMS_CONSUMER_LEASE_WRITE_CAPACITY", "9");
+        std::env::set_var("DDB_STREAMS_CONSUMER_LEASE_PITR", "true");
         let c = Config::from_env().unwrap();
         assert_eq!(c.owner, "worker-9");
         assert_eq!(c.max_leases, 5);
         assert_eq!(c.lease_duration_ms, 3000);
         assert_eq!(c.poll_interval_ms, 200);
         assert_eq!(c.cycle_interval_ms, 250);
+        assert_eq!(c.max_records, Some(250));
+        assert_eq!(
+            c.lease_table_config.billing,
+            LeaseBilling::Provisioned {
+                read_capacity: 7,
+                write_capacity: 9,
+            }
+        );
+        assert!(c.lease_table_config.pitr);
         clear();
     }
 

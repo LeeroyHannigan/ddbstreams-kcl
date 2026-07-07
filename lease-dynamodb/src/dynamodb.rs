@@ -9,7 +9,7 @@ use crate::Lease;
 use aws_sdk_dynamodb::error::ProvideErrorMetadata;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType,
-    ScalarAttributeType, TableStatus,
+    PointInTimeRecoverySpecification, ProvisionedThroughput, ScalarAttributeType, TableStatus,
 };
 use aws_sdk_dynamodb::Client;
 use std::collections::HashMap;
@@ -55,6 +55,32 @@ const THROTTLE_CODES: &[&str] = &[
 pub struct DynamoDbLeaseStore {
     client: Client,
     table: String,
+    table_config: LeaseTableConfig,
+}
+
+/// Billing mode applied when [`DynamoDbLeaseStore::ensure_table`] auto-creates
+/// the lease table.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum LeaseBilling {
+    /// On-demand capacity (default) — nothing to provision.
+    #[default]
+    PayPerRequest,
+    /// Provisioned capacity with fixed read/write units.
+    Provisioned {
+        read_capacity: i64,
+        write_capacity: i64,
+    },
+}
+
+/// Options applied ONLY when the lease table is auto-created (never mutated on a
+/// pre-existing, user-managed table). Mirrors KCL's lease-table billing and
+/// point-in-time-recovery knobs.
+#[derive(Clone, Debug, Default)]
+pub struct LeaseTableConfig {
+    pub billing: LeaseBilling,
+    /// Enable point-in-time recovery (PITR) on the freshly-created table.
+    /// Requires the `dynamodb:UpdateContinuousBackups` permission.
+    pub pitr: bool,
 }
 
 impl DynamoDbLeaseStore {
@@ -62,7 +88,15 @@ impl DynamoDbLeaseStore {
         Self {
             client,
             table: table.into(),
+            table_config: LeaseTableConfig::default(),
         }
+    }
+
+    /// Set the options used when `ensure_table` auto-creates the lease table
+    /// (billing mode, PITR). Ignored if the table already exists.
+    pub fn with_table_config(mut self, table_config: LeaseTableConfig) -> Self {
+        self.table_config = table_config;
+        self
     }
 
     pub async fn from_env(table: impl Into<String>) -> Self {
@@ -70,8 +104,9 @@ impl DynamoDbLeaseStore {
         Self::new(Client::new(&cfg), table)
     }
 
-    /// Create the lease table (PK `leaseKey`, PAY_PER_REQUEST) if absent, and
-    /// wait until ACTIVE. Idempotent.
+    /// Create the lease table (PK `leaseKey`) if absent, applying the configured
+    /// billing mode (default PAY_PER_REQUEST) and, on a freshly-created table,
+    /// enabling PITR when requested; then wait until ACTIVE. Idempotent.
     pub async fn ensure_table(&self) -> Result<(), BoxError> {
         let exists = self
             .client
@@ -81,7 +116,8 @@ impl DynamoDbLeaseStore {
             .await
             .is_ok();
         if !exists {
-            self.client
+            let mut create = self
+                .client
                 .create_table()
                 .table_name(&self.table)
                 .attribute_definitions(
@@ -95,10 +131,22 @@ impl DynamoDbLeaseStore {
                         .attribute_name(LEASE_KEY)
                         .key_type(KeyType::Hash)
                         .build()?,
-                )
-                .billing_mode(BillingMode::PayPerRequest)
-                .send()
-                .await?;
+                );
+            create = match &self.table_config.billing {
+                LeaseBilling::PayPerRequest => create.billing_mode(BillingMode::PayPerRequest),
+                LeaseBilling::Provisioned {
+                    read_capacity,
+                    write_capacity,
+                } => create
+                    .billing_mode(BillingMode::Provisioned)
+                    .provisioned_throughput(
+                        ProvisionedThroughput::builder()
+                            .read_capacity_units(*read_capacity)
+                            .write_capacity_units(*write_capacity)
+                            .build()?,
+                    ),
+            };
+            create.send().await?;
         }
         loop {
             let d = self
@@ -108,10 +156,45 @@ impl DynamoDbLeaseStore {
                 .send()
                 .await?;
             if d.table().and_then(|t| t.table_status()) == Some(&TableStatus::Active) {
-                return Ok(());
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
+        // PITR is only applied when WE created the table (never mutate a
+        // pre-existing, user-managed table) and only if requested. Requires
+        // dynamodb:UpdateContinuousBackups. A freshly-created table's backup
+        // subsystem may not be ready for a moment, in which case
+        // UpdateContinuousBackups returns a retryable
+        // ContinuousBackupsUnavailableException; retry with linear backoff.
+        if !exists && self.table_config.pitr {
+            let mut attempt: u32 = 0;
+            loop {
+                let r = self
+                    .client
+                    .update_continuous_backups()
+                    .table_name(&self.table)
+                    .point_in_time_recovery_specification(
+                        PointInTimeRecoverySpecification::builder()
+                            .point_in_time_recovery_enabled(true)
+                            .build()?,
+                    )
+                    .send()
+                    .await;
+                match r {
+                    Ok(_) => break,
+                    Err(e)
+                        if attempt < 12
+                            && e.code() == Some("ContinuousBackupsUnavailableException") =>
+                    {
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
+                            .await;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Scan every lease row in the table (used by the coordinator).

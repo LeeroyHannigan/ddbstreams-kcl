@@ -36,6 +36,16 @@ pub struct DdbStreamsSource {
     stream_arn: String,
     /// Per-shard threaded iterators (shard id -> next iterator + its position).
     cursors: Mutex<HashMap<String, Cursor>>,
+    /// Optional `GetRecords` batch-size limit (`None` = service default). DynamoDB
+    /// Streams accepts 1..=1000; see [`clamp_max_records`].
+    max_records: Option<i32>,
+}
+
+/// DynamoDB Streams `GetRecords` accepts a `Limit` of 1..=1000; clamp any
+/// caller-supplied value into that range so we never send a request the service
+/// would reject.
+fn clamp_max_records(n: i32) -> i32 {
+    n.clamp(1, 1000)
 }
 
 impl DdbStreamsSource {
@@ -44,7 +54,15 @@ impl DdbStreamsSource {
             client,
             stream_arn: stream_arn.into(),
             cursors: Mutex::new(HashMap::new()),
+            max_records: None,
         }
+    }
+
+    /// Set the `GetRecords` batch-size limit (clamped to DynamoDB Streams'
+    /// 1..=1000). `None`/unset uses the service default.
+    pub fn with_max_records(mut self, n: i32) -> Self {
+        self.max_records = Some(clamp_max_records(n));
+        self
     }
 
     /// Build a source from the ambient AWS environment (creds, region).
@@ -267,6 +285,7 @@ impl DdbStreamsSource {
             self.client
                 .get_records()
                 .shard_iterator(&iterator)
+                .set_limit(self.max_records)
                 .send()
                 .await
                 .map_err(|e| -> BoxError { e.into() })
@@ -293,6 +312,7 @@ impl DdbStreamsSource {
                     self.client
                         .get_records()
                         .shard_iterator(&fresh)
+                        .set_limit(self.max_records)
                         .send()
                         .await?
                 } else {
@@ -406,6 +426,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_records_is_clamped_to_streams_valid_range() {
+        // DynamoDB Streams GetRecords accepts a Limit of 1..=1000.
+        assert_eq!(clamp_max_records(500), 500); // in range: unchanged
+        assert_eq!(clamp_max_records(1), 1); // lower bound
+        assert_eq!(clamp_max_records(1000), 1000); // upper bound
+        assert_eq!(clamp_max_records(0), 1); // below range -> 1
+        assert_eq!(clamp_max_records(-7), 1); // negative -> 1
+        assert_eq!(clamp_max_records(5000), 1000); // above range -> 1000
+    }
 
     #[test]
     fn cursor_reused_only_when_it_continues_from_requested_position() {
