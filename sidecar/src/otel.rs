@@ -100,7 +100,27 @@ impl OtelMetricsSink {
         let reader = PeriodicReader::builder(exporter, opentelemetry_sdk::runtime::Tokio)
             .with_interval(Duration::from_millis(interval_ms))
             .build();
-        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        // CloudWatch's OTLP endpoint files metrics under the CloudWatch namespace
+        // taken from the `service.namespace` resource attribute. Without a
+        // Resource the endpoint accepts the POST (HTTP 200) but has no namespace
+        // to file under and silently drops the metrics. `Resource::default()`
+        // runs env detection (OTEL_RESOURCE_ATTRIBUTES / OTEL_SERVICE_NAME); if
+        // the user set no service.namespace, fall back to a default so metrics
+        // always land somewhere queryable.
+        let has_ns = std::env::var("OTEL_RESOURCE_ATTRIBUTES")
+            .map(|v| v.contains("service.namespace"))
+            .unwrap_or(false);
+        let resource = if has_ns {
+            opentelemetry_sdk::Resource::default()
+        } else {
+            opentelemetry_sdk::Resource::default().merge(&opentelemetry_sdk::Resource::new([
+                KeyValue::new("service.namespace", "DynamoDBStreamsConsumer"),
+            ]))
+        };
+        let provider = SdkMeterProvider::builder()
+            .with_reader(reader)
+            .with_resource(resource)
+            .build();
         let meter: Meter = provider.meter("amazon-dynamodb-streams-consumer");
 
         let lag = meter
