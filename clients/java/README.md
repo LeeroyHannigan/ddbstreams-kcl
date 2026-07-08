@@ -124,14 +124,14 @@ consumption begins:
 - `TRIM_HORIZON` (default) — start at the oldest available record in the shard.
 - `LATEST` — start at the newest records, skipping existing backlog.
 
-The value is case-insensitive (normalized to uppercase). Once a checkpoint
+Once a checkpoint
 exists for a shard, resume always continues from the checkpoint regardless of
 this setting.
 
 ```java
 WorkerConfig.builder()
     // ...
-    .initialPosition("LATEST") // default is TRIM_HORIZON
+    .initialPosition(InitialPosition.LATEST) // default is TRIM_HORIZON
     .build();
 ```
 

@@ -15,7 +15,7 @@ public final class WorkerConfig {
     final Long leaseDurationMs;
     final Long pollIntervalMs;
     final Long cycleIntervalMs;
-    final String initialPosition;
+    final InitialPosition initialPosition;
     final String sidecarPath;
     final List<String> sidecarCmd;
 
@@ -51,7 +51,7 @@ public final class WorkerConfig {
         private Long leaseDurationMs;
         private Long pollIntervalMs;
         private Long cycleIntervalMs;
-        private String initialPosition;
+        private InitialPosition initialPosition;
         private String sidecarPath;
         private List<String> sidecarCmd;
 
@@ -111,8 +111,8 @@ public final class WorkerConfig {
             return this;
         }
 
-        /** Where consumption starts when no checkpoint exists: {@code TRIM_HORIZON} (default) or {@code LATEST}. Optional. */
-        public Builder initialPosition(String v) {
+        /** Where consumption starts when no checkpoint exists: {@link InitialPosition#TRIM_HORIZON} (default) or {@link InitialPosition#LATEST}. Optional. */
+        public Builder initialPosition(InitialPosition v) {
             this.initialPosition = v;
             return this;
         }

@@ -3,6 +3,19 @@ using System.Text.Json;
 
 namespace Amazon.DynamoDBStreams.Consumer;
 
+/// <summary>
+/// Where a freshly-seeded shard (no checkpoint) begins reading:
+/// <see cref="InitialPosition.TrimHorizon"/> (default) or <see cref="InitialPosition.Latest"/>.
+/// </summary>
+public enum InitialPosition
+{
+    /// <summary>Read the shard from the oldest available record (default).</summary>
+    TrimHorizon,
+
+    /// <summary>Read only records written after the consumer starts.</summary>
+    Latest,
+}
+
 /// <summary>Configuration for a <see cref="Worker"/>.</summary>
 public sealed class WorkerConfig
 {
@@ -42,7 +55,7 @@ public sealed class WorkerConfig
     /// available record; <c>LATEST</c> reads only records written after the
     /// worker starts. Case-insensitive.
     /// </summary>
-    public string? InitialPosition { get; set; }
+    public InitialPosition? InitialPosition { get; set; }
 
     /// <summary>Explicit sidecar binary path (overrides discovery). Optional.</summary>
     public string? SidecarPath { get; set; }
@@ -261,7 +274,11 @@ public sealed class Worker
         }
         if (_config.InitialPosition is { } ip)
         {
-            e["DDB_STREAMS_CONSUMER_INITIAL_POSITION"] = ip.Trim().ToUpperInvariant();
+            e["DDB_STREAMS_CONSUMER_INITIAL_POSITION"] = ip switch
+            {
+                InitialPosition.Latest => "LATEST",
+                _ => "TRIM_HORIZON",
+            };
         }
     }
 

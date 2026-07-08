@@ -5,7 +5,16 @@ checkpoints; this package spawns it and delivers ordered, checkpointed change
 records to your :class:`RecordProcessor`."""
 
 from .record import Record, decode_attr, decode_item
-from .worker import RecordProcessor, Worker
+from .worker import LATEST, TRIM_HORIZON, InitialPosition, RecordProcessor, Worker
 
-__all__ = ["Worker", "Record", "RecordProcessor", "decode_attr", "decode_item"]
+__all__ = [
+    "Worker",
+    "Record",
+    "RecordProcessor",
+    "decode_attr",
+    "decode_item",
+    "InitialPosition",
+    "TRIM_HORIZON",
+    "LATEST",
+]
 __version__ = "0.1.0"

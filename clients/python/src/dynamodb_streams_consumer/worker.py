@@ -32,9 +32,14 @@ import os
 import shutil
 import subprocess
 import threading
-from typing import Any, List, Optional, Protocol, Sequence
+from typing import Any, List, Literal, Optional, Protocol, Sequence
 
 from .record import DDB_JSON, NATIVE, Record
+
+#: Where a freshly-seeded shard (no checkpoint) begins reading.
+TRIM_HORIZON = "TRIM_HORIZON"
+LATEST = "LATEST"
+InitialPosition = Literal["TRIM_HORIZON", "LATEST"]
 
 DEFAULT_BINARY = "amazon-dynamodb-streams-consumer-sidecar"
 
@@ -84,7 +89,7 @@ class Worker:
         lease_duration_ms: Optional[int] = None,
         poll_interval_ms: Optional[int] = None,
         cycle_interval_ms: Optional[int] = None,
-        initial_position: Optional[str] = None,
+        initial_position: Optional[InitialPosition] = None,
         sidecar_path: Optional[str] = None,
         sidecar_cmd: Optional[Sequence[str]] = None,
     ) -> None:

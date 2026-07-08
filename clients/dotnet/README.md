@@ -118,14 +118,14 @@ begins:
 new WorkerConfig
 {
     // ...
-    InitialPosition = "LATEST", // default is "TRIM_HORIZON"
+    InitialPosition = InitialPosition.Latest, // default is InitialPosition.TrimHorizon
 }
 ```
 
 - `TRIM_HORIZON` (default) — start from the oldest available record in the shard.
 - `LATEST` — start from records written after the worker begins.
 
-The value is case-insensitive. Shards that already have a checkpoint always
+Shards that already have a checkpoint always
 resume from it, regardless of this setting.
 
 ## Testing

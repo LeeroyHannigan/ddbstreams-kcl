@@ -30,7 +30,7 @@ class WorkerEnvTest {
 
     @Test
     void initialPositionIsNormalizedToUpperCase() throws Exception {
-        Map<String, String> env = envFor(baseBuilder().initialPosition("latest").build());
+        Map<String, String> env = envFor(baseBuilder().initialPosition(InitialPosition.LATEST).build());
         assertEquals("LATEST", env.get("DDB_STREAMS_CONSUMER_INITIAL_POSITION"));
     }
 

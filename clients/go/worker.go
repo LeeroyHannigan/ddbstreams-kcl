@@ -48,6 +48,16 @@ type ShutdownRequestedHandler interface {
 	ShutdownRequested(shardID string)
 }
 
+// InitialPosition selects where a freshly-seeded shard (no checkpoint) begins
+// reading. Use the constants below; a bare string ("TRIM_HORIZON"/"LATEST")
+// also assigns since the underlying type is string.
+type InitialPosition string
+
+const (
+	TrimHorizon InitialPosition = "TRIM_HORIZON"
+	Latest      InitialPosition = "LATEST"
+)
+
 // Config configures a Worker. StreamArn, LeaseTable, and Processor are required.
 type Config struct {
 	StreamArn  string
@@ -62,9 +72,9 @@ type Config struct {
 	LeaseDurationMS int
 	PollIntervalMS  int
 	CycleIntervalMS int
-	// InitialPosition selects where a freshly-seeded shard begins reading.
-	// Values: "TRIM_HORIZON" (default) or "LATEST".
-	InitialPosition string
+	// InitialPosition selects where a freshly-seeded shard begins reading:
+	// TrimHorizon (default) or Latest.
+	InitialPosition InitialPosition
 
 	// SidecarPath overrides sidecar discovery with an explicit binary path.
 	SidecarPath string
@@ -126,7 +136,7 @@ func (w *Worker) env() []string {
 		add("DDB_STREAMS_CONSUMER_CYCLE_INTERVAL_MS", strconv.Itoa(w.cfg.CycleIntervalMS))
 	}
 	if w.cfg.InitialPosition != "" {
-		add("DDB_STREAMS_CONSUMER_INITIAL_POSITION", strings.ToUpper(strings.TrimSpace(w.cfg.InitialPosition)))
+		add("DDB_STREAMS_CONSUMER_INITIAL_POSITION", strings.ToUpper(strings.TrimSpace(string(w.cfg.InitialPosition))))
 	}
 	return env
 }

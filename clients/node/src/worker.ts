@@ -34,13 +34,25 @@ export interface WorkerConfig {
   leaseDurationMs?: number;
   pollIntervalMs?: number;
   cycleIntervalMs?: number;
-  /** Where to start reading a shard with no checkpoint: 'TRIM_HORIZON' (default) or 'LATEST'. */
-  initialPosition?: string;
+  /** Where to start reading a shard with no checkpoint: `InitialPosition.TrimHorizon`
+   *  (default) or `InitialPosition.Latest`. A bare `'TRIM_HORIZON'`/`'LATEST'` also works. */
+  initialPosition?: InitialPosition;
   /** Explicit sidecar binary path (overrides discovery). */
   sidecarPath?: string;
   /** Full launch argv (tests / custom launch; overrides discovery). */
   sidecarCmd?: string[];
 }
+
+/**
+ * Where a freshly-seeded shard (no checkpoint) begins reading. Reference a named
+ * value (`InitialPosition.Latest`) or pass the bare string (`'LATEST'`) — both
+ * type-check. Forwarded verbatim to the sidecar.
+ */
+export const InitialPosition = {
+  TrimHorizon: 'TRIM_HORIZON',
+  Latest: 'LATEST',
+} as const;
+export type InitialPosition = (typeof InitialPosition)[keyof typeof InitialPosition];
 
 interface ServerMessage {
   type: string;
