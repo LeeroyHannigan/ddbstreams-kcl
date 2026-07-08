@@ -611,6 +611,48 @@ mod tests {
     }
 
     #[test]
+    fn classify_maps_conditional_throttle_and_other() {
+        use aws_sdk_dynamodb::error::{ErrorMetadata, ProvideErrorMetadata};
+
+        #[derive(Debug)]
+        struct FakeErr(ErrorMetadata);
+        impl FakeErr {
+            fn with_code(code: &str) -> Self {
+                FakeErr(ErrorMetadata::builder().code(code).build())
+            }
+        }
+        impl std::fmt::Display for FakeErr {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{:?}", self.0.code())
+            }
+        }
+        impl std::error::Error for FakeErr {}
+        impl ProvideErrorMetadata for FakeErr {
+            fn meta(&self) -> &ErrorMetadata {
+                &self.0
+            }
+        }
+
+        // Conditional-check failure => the optimistic lock was lost.
+        assert!(matches!(
+            classify(FakeErr::with_code(CONDITIONAL_CHECK_FAILED)),
+            LeaseError::Lost
+        ));
+        // Each throttle code => retryable Throttled (must NOT be seen as Lost).
+        for c in THROTTLE_CODES {
+            assert!(
+                matches!(classify(FakeErr::with_code(c)), LeaseError::Throttled(_)),
+                "code {c} should classify as Throttled"
+            );
+        }
+        // Any other error => opaque Aws (neither Lost nor Throttled).
+        assert!(matches!(
+            classify(FakeErr::with_code("ValidationException")),
+            LeaseError::Aws(_)
+        ));
+    }
+
+    #[test]
     fn throttle_retry_succeeds_after_transient_throttles() {
         let calls = Cell::new(0);
         let out: Result<u32, LeaseError> = rt().block_on(with_throttle_retry(|| {

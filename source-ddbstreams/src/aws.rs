@@ -472,4 +472,54 @@ mod tests {
         assert!(!is_recoverable(&mk("ValidationException: bad input")));
         assert!(!is_recoverable(&mk("some other service error")));
     }
+
+    #[test]
+    fn throttling_errors_are_classified() {
+        let mk = |s: &str| -> BoxError { s.to_string().into() };
+        assert!(is_throttling(&mk("ProvisionedThroughputExceededException")));
+        assert!(is_throttling(&mk("ThrottlingException: rate exceeded")));
+        assert!(is_throttling(&mk("RequestLimitExceeded")));
+        assert!(is_throttling(&mk("LimitExceededException")));
+        // Recoverable-but-not-throttle and hard errors are not retried as throttles.
+        assert!(!is_throttling(&mk("ExpiredIteratorException")));
+        assert!(!is_throttling(&mk("ValidationException: bad input")));
+    }
+
+    #[test]
+    fn throttle_retry_retries_throttles_then_passes_through_others() {
+        use std::cell::Cell;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        // Throttled twice, then succeeds → 3 total attempts.
+        let calls = Cell::new(0u32);
+        let ok: Result<u8, BoxError> = rt.block_on(with_throttle_retry(|| {
+            let n = calls.get();
+            calls.set(n + 1);
+            async move {
+                if n < 2 {
+                    Err("ThrottlingException".to_string().into())
+                } else {
+                    Ok(7u8)
+                }
+            }
+        }));
+        assert_eq!(ok.unwrap(), 7);
+        assert_eq!(
+            calls.get(),
+            3,
+            "should retry the two throttles then succeed"
+        );
+
+        // A non-throttle error returns immediately (no retry).
+        let calls2 = Cell::new(0u32);
+        let err: Result<u8, BoxError> = rt.block_on(with_throttle_retry(|| {
+            calls2.set(calls2.get() + 1);
+            async move { Err::<u8, BoxError>("ExpiredIteratorException".to_string().into()) }
+        }));
+        assert!(err.is_err());
+        assert_eq!(calls2.get(), 1, "non-throttle errors must not be retried");
+    }
 }
