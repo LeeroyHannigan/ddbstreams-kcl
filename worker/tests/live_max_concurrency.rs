@@ -7,6 +7,7 @@
 //!   1. concurrent `deliver` calls never exceed the cap (the bound holds live),
 //!   2. every written record is delivered exactly once (0 loss, 0 duplicate),
 //!   3. per-shard sequence order is preserved.
+//!
 //! It also prints the process RSS + shard count as informational footprint data.
 //!
 //! Skipped unless `DDB_STREAMS_CONSUMER_IT=1`. Creates + deletes its own tables.
