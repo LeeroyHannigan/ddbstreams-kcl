@@ -10,6 +10,18 @@ single `vX.Y.Z` git tag releases the whole project.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-07-20
+
+### Added
+- `max_processing_concurrency` (opt-in) on every client and the sidecar
+  (`DDB_STREAMS_CONSUMER_MAX_PROCESSING_CONCURRENCY`): caps the number of shards
+  processed concurrently so per-worker footprint stays O(cap) as the stream's
+  shard count grows. Unset keeps prior behavior (one processing slot per shard).
+  Delivery and ordering semantics are unchanged (at-least-once, per-item and
+  per-shard order preserved; a shard is never split). Supports online resize.
+- Processing-concurrency metrics: per-slot-wait (`processing.slot_wait_ms`) and
+  the configured cap (`processing.max_concurrency`), exported via the OTEL sink.
+
 ## [0.1.3] - 2026-07-04
 
 ### Added
@@ -54,7 +66,8 @@ Initial alpha release.
 - Sidecar binary and a newline-delimited JSON protocol for language clients.
 - Python client (`dynamodb_streams_consumer`) with a zero-dependency stdio bridge.
 
-[Unreleased]: https://github.com/LeeroyHannigan/amazon-dynamodb-streams-consumer/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/LeeroyHannigan/amazon-dynamodb-streams-consumer/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/LeeroyHannigan/amazon-dynamodb-streams-consumer/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/LeeroyHannigan/amazon-dynamodb-streams-consumer/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/LeeroyHannigan/amazon-dynamodb-streams-consumer/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/LeeroyHannigan/amazon-dynamodb-streams-consumer/compare/v0.1.0...v0.1.1

@@ -10,11 +10,11 @@ members = [
     "clients/rust",
 ]
 
-# Single source of truth for the version across every crate (lockstep). Bump
-# here; each crate inherits via `version.workspace = true`. The Python client
-# derives the same version from the git tag (setuptools-scm), so one
-# `vX.Y.Z` tag releases the whole project.
+# Single source of truth for the Rust crate version across the workspace
+# (lockstep via `version.workspace = true`). The language clients carry their
+# own version fields (clients/<lang>/…) and are bumped in lockstep to match,
+# so a single `vX.Y.Z` git tag corresponds to one repo-wide version.
 [workspace.package]
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 license = "Apache-2.0"
