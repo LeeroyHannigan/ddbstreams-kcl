@@ -40,6 +40,11 @@ public sealed class WorkerConfig
     /// <summary>Maximum shard leases held at once. Optional.</summary>
     public int? MaxLeases { get; set; }
 
+    /// <summary>Cap on shards processed concurrently (opt-in). Unset = one slot per shard.
+    /// Bounds concurrent delivery so footprint stays O(max) as shard count grows;
+    /// preserves at-least-once + per-item + per-shard ordering.</summary>
+    public int? MaxProcessingConcurrency { get; set; }
+
     /// <summary>Lease duration in milliseconds. Optional.</summary>
     public long? LeaseDurationMs { get; set; }
 
@@ -259,6 +264,10 @@ public sealed class Worker
         if (_config.MaxLeases is { } ml)
         {
             e["DDB_STREAMS_CONSUMER_MAX_LEASES"] = ml.ToString();
+        }
+        if (_config.MaxProcessingConcurrency is { } mpc)
+        {
+            e["DDB_STREAMS_CONSUMER_MAX_PROCESSING_CONCURRENCY"] = mpc.ToString();
         }
         if (_config.LeaseDurationMs is { } ld)
         {

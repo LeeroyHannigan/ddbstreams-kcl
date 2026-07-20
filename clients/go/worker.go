@@ -72,6 +72,11 @@ type Config struct {
 	LeaseDurationMS int
 	PollIntervalMS  int
 	CycleIntervalMS int
+	// MaxProcessingConcurrency caps the shards processed concurrently (opt-in;
+	// 0 = unbounded, one slot per shard). Bounds concurrent delivery so footprint
+	// stays O(max) as shard count grows; preserves at-least-once + per-item +
+	// per-shard ordering.
+	MaxProcessingConcurrency int
 	// InitialPosition selects where a freshly-seeded shard begins reading:
 	// TrimHorizon (default) or Latest.
 	InitialPosition InitialPosition
@@ -125,6 +130,9 @@ func (w *Worker) env() []string {
 	}
 	if w.cfg.MaxLeases > 0 {
 		add("DDB_STREAMS_CONSUMER_MAX_LEASES", strconv.Itoa(w.cfg.MaxLeases))
+	}
+	if w.cfg.MaxProcessingConcurrency > 0 {
+		add("DDB_STREAMS_CONSUMER_MAX_PROCESSING_CONCURRENCY", strconv.Itoa(w.cfg.MaxProcessingConcurrency))
 	}
 	if w.cfg.LeaseDurationMS > 0 {
 		add("DDB_STREAMS_CONSUMER_LEASE_DURATION_MS", strconv.Itoa(w.cfg.LeaseDurationMS))

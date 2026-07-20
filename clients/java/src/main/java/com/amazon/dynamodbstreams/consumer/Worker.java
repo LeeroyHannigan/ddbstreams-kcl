@@ -164,6 +164,9 @@ public final class Worker {
         if (config.maxLeases != null) {
             e.put("DDB_STREAMS_CONSUMER_MAX_LEASES", config.maxLeases.toString());
         }
+        if (config.maxProcessingConcurrency != null) {
+            e.put("DDB_STREAMS_CONSUMER_MAX_PROCESSING_CONCURRENCY", config.maxProcessingConcurrency.toString());
+        }
         if (config.leaseDurationMs != null) {
             e.put("DDB_STREAMS_CONSUMER_LEASE_DURATION_MS", config.leaseDurationMs.toString());
         }

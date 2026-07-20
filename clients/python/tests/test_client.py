@@ -129,6 +129,7 @@ class TestWorkerEdgeCases(unittest.TestCase):
             stream_arn="the-arn", lease_table="the-table", processor=_MinimalProcessor(),
             owner="own", region="eu-west-1", max_leases=7,
             lease_duration_ms=1234, poll_interval_ms=55, cycle_interval_ms=66,
+            max_processing_concurrency=4,
             initial_position="latest",
             sidecar_cmd=["true"],
         )
@@ -141,6 +142,7 @@ class TestWorkerEdgeCases(unittest.TestCase):
         self.assertEqual(env["DDB_STREAMS_CONSUMER_LEASE_DURATION_MS"], "1234")
         self.assertEqual(env["DDB_STREAMS_CONSUMER_POLL_INTERVAL_MS"], "55")
         self.assertEqual(env["DDB_STREAMS_CONSUMER_CYCLE_INTERVAL_MS"], "66")
+        self.assertEqual(env["DDB_STREAMS_CONSUMER_MAX_PROCESSING_CONCURRENCY"], "4")
         # case-insensitive input is normalized to uppercase
         self.assertEqual(env["DDB_STREAMS_CONSUMER_INITIAL_POSITION"], "LATEST")
 

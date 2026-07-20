@@ -85,6 +85,12 @@ environment (same as any AWS SDK).
 `owner`, `region`, `max_leases`, `lease_duration_ms`, `poll_interval_ms`,
 `cycle_interval_ms` — all optional keyword args on `Worker(...)`.
 
+`max_processing_concurrency` — optional keyword arg on `Worker(...)`. Caps the
+number of shards processed concurrently, so footprint stays O(max) as the
+table's shard/partition count grows. Unset = one processing slot per shard
+(prior behavior). Bounds concurrent record delivery only; at-least-once,
+per-item, and per-shard ordering are preserved.
+
 `initial_position` — optional keyword arg on `Worker(...)` controlling where a
 freshly-seeded shard begins reading. Values are `TRIM_HORIZON` (the default —
 start at the oldest available record) and `LATEST` (start at the newest). Input

@@ -124,3 +124,10 @@ npm test   # tsc build + node --test (unit + shared conformance)
 The conformance suite runs the shared `../../conformance/fixtures/*.json`
 against the language-agnostic `replay_sidecar.py` — no AWS, no real sidecar
 (needs `python3` on PATH).
+
+## Bounding footprint
+
+`maxProcessingConcurrency` (optional config field) caps the number of shards
+processed concurrently, keeping footprint O(max) as the table's shard/partition
+count grows. Unset = one processing slot per shard. Bounds concurrent record
+delivery only; at-least-once, per-item, and per-shard ordering are preserved.

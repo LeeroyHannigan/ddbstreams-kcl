@@ -15,6 +15,7 @@ public final class WorkerConfig {
     final Long leaseDurationMs;
     final Long pollIntervalMs;
     final Long cycleIntervalMs;
+    final Integer maxProcessingConcurrency;
     final InitialPosition initialPosition;
     final String sidecarPath;
     final List<String> sidecarCmd;
@@ -30,6 +31,7 @@ public final class WorkerConfig {
         this.leaseDurationMs = b.leaseDurationMs;
         this.pollIntervalMs = b.pollIntervalMs;
         this.cycleIntervalMs = b.cycleIntervalMs;
+        this.maxProcessingConcurrency = b.maxProcessingConcurrency;
         this.initialPosition = b.initialPosition;
         this.sidecarPath = b.sidecarPath;
         this.sidecarCmd = b.sidecarCmd;
@@ -51,6 +53,7 @@ public final class WorkerConfig {
         private Long leaseDurationMs;
         private Long pollIntervalMs;
         private Long cycleIntervalMs;
+        private Integer maxProcessingConcurrency;
         private InitialPosition initialPosition;
         private String sidecarPath;
         private List<String> sidecarCmd;
@@ -93,6 +96,14 @@ public final class WorkerConfig {
 
         public Builder maxLeases(int v) {
             this.maxLeases = v;
+            return this;
+        }
+
+        /** Cap on shards processed concurrently (opt-in). Unset = one slot per shard.
+         *  Bounds concurrent delivery so footprint stays O(max) as shard count grows;
+         *  preserves at-least-once + per-item + per-shard ordering. */
+        public Builder maxProcessingConcurrency(int v) {
+            this.maxProcessingConcurrency = v;
             return this;
         }
 
