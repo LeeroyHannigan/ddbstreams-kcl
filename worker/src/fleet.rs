@@ -340,6 +340,11 @@ where
             .map(|r| (r.lease_key.clone(), (r.lease_counter, r.checkpoint.clone())))
             .collect();
         self.metrics.on_leases_held(owned.len() as u64);
+        if let Some(pl) = self.processing_limit.as_ref() {
+            self.metrics.on_max_processing_concurrency(
+                pl.max.load(std::sync::atomic::Ordering::SeqCst) as u64,
+            );
+        }
         let completed: HashSet<ShardId> = shard_rows
             .iter()
             .filter(|r| r.completed)
@@ -622,12 +627,17 @@ where
             // heartbeats are deliberately outside this permit. The semaphore is
             // never closed, so acquire cannot fail.
             let _permit = match limit.as_ref() {
-                Some(pl) => Some(
-                    pl.sem
+                Some(pl) => {
+                    let wait_start = Instant::now();
+                    let p = pl
+                        .sem
                         .acquire()
                         .await
-                        .expect("processing semaphore is never closed"),
-                ),
+                        .expect("processing semaphore is never closed");
+                    metrics
+                        .on_processing_slot_wait(&shard, wait_start.elapsed().as_millis() as u64);
+                    Some(p)
+                }
                 None => None,
             };
             // Deliver and let the consumer decide the checkpoint (its ack). A
@@ -1709,6 +1719,8 @@ mod tests {
         batches: Mutex<Vec<CapturedBatch>>,
         describes: std::sync::atomic::AtomicU64,
         shard_ends: std::sync::atomic::AtomicU64,
+        slot_waits: Mutex<Vec<(String, u64)>>,
+        max_concurrency: std::sync::atomic::AtomicU64,
     }
     impl amazon_dynamodb_streams_consumer_core::metrics::MetricsSink for CaptureSink {
         fn on_batch(&self, m: &ShardMetrics<'_>) {
@@ -1726,6 +1738,16 @@ mod tests {
         fn on_shard_end(&self, _shard_id: &str) {
             self.shard_ends
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn on_processing_slot_wait(&self, shard_id: &str, wait_ms: u64) {
+            self.slot_waits
+                .lock()
+                .unwrap()
+                .push((shard_id.to_string(), wait_ms));
+        }
+        fn on_max_processing_concurrency(&self, cap: u64) {
+            self.max_concurrency
+                .store(cap, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -2229,6 +2251,47 @@ mod tests {
             pl.sem.available_permits(),
             1,
             "one permit reclaimed, one remains"
+        );
+    }
+
+    #[tokio::test]
+    async fn cap_emits_slot_wait_and_gauge_metrics() {
+        // With a cap set, the fleet reports the configured cap (gauge) and a
+        // slot-wait sample per delivered batch. Unbounded fleets emit neither.
+        let (metas, data) = roots(6);
+        let sink = Arc::new(CaptureSink::default());
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let factory = Arc::new(ConcFactory {
+            cur: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            delivered,
+        });
+        let fleet = Fleet::new(
+            FakeSource { metas, data },
+            FakeLeases::default(),
+            factory,
+            FleetConfig {
+                owner: "w1".into(),
+                max_leases: 100,
+                lease_duration_ms: 100_000,
+                poll_interval_ms: 1,
+                initial_position: InitialPosition::default(),
+            },
+        )
+        .with_metrics(sink.clone())
+        .with_max_processing_concurrency(Some(2));
+        fleet.run_until_complete(10).await.unwrap();
+
+        assert_eq!(
+            sink.max_concurrency
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "configured cap reported as a gauge"
+        );
+        assert_eq!(
+            sink.slot_waits.lock().unwrap().len(),
+            6,
+            "one slot-wait sample per delivered batch (6 shards)"
         );
     }
 }

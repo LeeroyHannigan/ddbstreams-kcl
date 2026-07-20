@@ -48,6 +48,8 @@ pub struct OtelMetricsSink {
     lease_acquired: Counter<u64>,
     lease_lost: Counter<u64>,
     leases_held: Gauge<u64>,
+    slot_wait: Gauge<u64>,
+    max_concurrency: Gauge<u64>,
     /// Dimensions applied to every metric (worker id, stream) so load can be
     /// attributed per host/stream, matching KCL's WorkerIdentifier/StreamId.
     base_attrs: Vec<KeyValue>,
@@ -157,6 +159,17 @@ impl OtelMetricsSink {
             .u64_gauge("ddbstreams.consumer.lease.held")
             .with_description("Shard leases this worker currently holds")
             .build();
+        let slot_wait = meter
+            .u64_gauge("ddbstreams.consumer.processing.slot_wait_ms")
+            .with_description(
+                "Time a batch waited to acquire a processing slot (max_processing_concurrency)",
+            )
+            .with_unit("ms")
+            .build();
+        let max_concurrency = meter
+            .u64_gauge("ddbstreams.consumer.processing.max_concurrency")
+            .with_description("Configured max_processing_concurrency cap (0 = unbounded)")
+            .build();
 
         // Base dimensions on every metric: worker id + stream, from the same env
         // the sidecar already uses. Empty values are omitted.
@@ -182,6 +195,8 @@ impl OtelMetricsSink {
             lease_acquired,
             lease_lost,
             leases_held,
+            slot_wait,
+            max_concurrency,
             base_attrs,
         })
     }
@@ -225,6 +240,12 @@ impl MetricsSink for OtelMetricsSink {
     }
     fn on_leases_held(&self, count: u64) {
         self.leases_held.record(count, &self.base_attrs);
+    }
+    fn on_processing_slot_wait(&self, shard_id: &str, wait_ms: u64) {
+        self.slot_wait.record(wait_ms, &self.shard_attrs(shard_id));
+    }
+    fn on_max_processing_concurrency(&self, cap: u64) {
+        self.max_concurrency.record(cap, &self.base_attrs);
     }
 }
 

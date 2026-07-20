@@ -42,6 +42,14 @@ pub trait MetricsSink: Send + Sync {
     /// Number of shard leases this worker currently holds, reported once per
     /// coordination cycle. Exported as a gauge for rebalance/failover health.
     fn on_leases_held(&self, _count: u64) {}
+    /// Milliseconds a shard's batch waited to acquire a processing slot, emitted
+    /// only when `max_processing_concurrency` is set. ~0 means the cap is not
+    /// binding; a growing value means the cap is throttling processing (raise it
+    /// or scale out). Not emitted when unbounded.
+    fn on_processing_slot_wait(&self, _shard_id: &str, _wait_ms: u64) {}
+    /// The configured processing-concurrency cap, reported once per cycle when
+    /// `max_processing_concurrency` is set (gauge). Reflects online resizes.
+    fn on_max_processing_concurrency(&self, _cap: u64) {}
 }
 
 /// Default sink that records nothing — metrics are opt-in and cost nothing when
@@ -114,6 +122,8 @@ mod tests {
         s.on_lease_acquired("s");
         s.on_lease_lost("s");
         s.on_leases_held(3);
+        s.on_processing_slot_wait("s", 12);
+        s.on_max_processing_concurrency(4);
         // Nothing to assert — just proving the default impls are callable/inert.
     }
 
