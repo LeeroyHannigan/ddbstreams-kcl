@@ -125,6 +125,9 @@ struct Config {
     graceful_shutdown_timeout_ms: u64,
     /// Optional GetRecords batch-size limit (None = service default).
     max_records: Option<i32>,
+    /// Optional cap on the number of shards processed concurrently
+    /// (None = unbounded, one processing slot per shard).
+    max_processing_concurrency: Option<usize>,
     /// Billing mode + PITR applied when the lease table is auto-created.
     lease_table_config: LeaseTableConfig,
 }
@@ -150,6 +153,13 @@ impl Config {
         let max_records = std::env::var("DDB_STREAMS_CONSUMER_MAX_RECORDS")
             .ok()
             .and_then(|v| v.parse::<i32>().ok());
+        // Optional processing-concurrency cap. Absent, unparseable, or 0 => None
+        // (unbounded), matching Fleet::with_max_processing_concurrency semantics.
+        let max_processing_concurrency =
+            std::env::var("DDB_STREAMS_CONSUMER_MAX_PROCESSING_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n >= 1);
         let lease_table_config = {
             let billing = match std::env::var("DDB_STREAMS_CONSUMER_LEASE_BILLING_MODE")
                 .unwrap_or_default()
@@ -187,6 +197,7 @@ impl Config {
                 5_000,
             ),
             max_records,
+            max_processing_concurrency,
             lease_table_config,
         })
     }
@@ -243,7 +254,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             poll_interval_ms: cfg.poll_interval_ms,
             initial_position: cfg.initial_position,
         },
-    );
+    )
+    .with_max_processing_concurrency(cfg.max_processing_concurrency);
 
     // Model A: if the standard OTEL exporter env var is set, attach the OTLP
     // metrics sink (feature-gated so the default build has no OTEL deps).
@@ -332,6 +344,7 @@ mod tests {
         "DDB_STREAMS_CONSUMER_INITIAL_POSITION",
         "DDB_STREAMS_CONSUMER_GRACEFUL_SHUTDOWN_MS",
         "DDB_STREAMS_CONSUMER_MAX_RECORDS",
+        "DDB_STREAMS_CONSUMER_MAX_PROCESSING_CONCURRENCY",
         "DDB_STREAMS_CONSUMER_LEASE_BILLING_MODE",
         "DDB_STREAMS_CONSUMER_LEASE_READ_CAPACITY",
         "DDB_STREAMS_CONSUMER_LEASE_WRITE_CAPACITY",
@@ -374,6 +387,7 @@ mod tests {
         );
         // Knob defaults: no explicit GetRecords limit, on-demand billing, no PITR.
         assert_eq!(c.max_records, None);
+        assert_eq!(c.max_processing_concurrency, None);
         assert_eq!(c.lease_table_config.billing, LeaseBilling::PayPerRequest);
         assert!(!c.lease_table_config.pitr);
         clear();
@@ -391,6 +405,7 @@ mod tests {
         std::env::set_var("DDB_STREAMS_CONSUMER_POLL_INTERVAL_MS", "200");
         std::env::set_var("DDB_STREAMS_CONSUMER_CYCLE_INTERVAL_MS", "250");
         std::env::set_var("DDB_STREAMS_CONSUMER_MAX_RECORDS", "250");
+        std::env::set_var("DDB_STREAMS_CONSUMER_MAX_PROCESSING_CONCURRENCY", "4");
         std::env::set_var("DDB_STREAMS_CONSUMER_LEASE_BILLING_MODE", "provisioned");
         std::env::set_var("DDB_STREAMS_CONSUMER_LEASE_READ_CAPACITY", "7");
         std::env::set_var("DDB_STREAMS_CONSUMER_LEASE_WRITE_CAPACITY", "9");
@@ -398,6 +413,7 @@ mod tests {
         let c = Config::from_env().unwrap();
         assert_eq!(c.owner, "worker-9");
         assert_eq!(c.max_leases, 5);
+        assert_eq!(c.max_processing_concurrency, Some(4));
         assert_eq!(c.lease_duration_ms, 3000);
         assert_eq!(c.poll_interval_ms, 200);
         assert_eq!(c.cycle_interval_ms, 250);
