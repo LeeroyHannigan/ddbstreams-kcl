@@ -87,11 +87,19 @@ let worker = Worker::builder()
     .await?;
 ```
 
-The cap bounds concurrent record delivery only — shard reads and lease
-heartbeats are unaffected, so idle shards keep their leases. It changes no
-delivery semantics: at-least-once, per-item ordering, and per-shard ordering all
-hold (a shard is never split; each shard is processed by one slot at a time).
-Leave it unset for the prior behavior (one slot per shard).
+The bound is the worker's **total footprint**: at most `k` shards are fetched,
+buffered, and processed at any instant, so in-flight `GetRecords` calls, batch
+buffers, and live processing contexts are all O(k) — independent of how many
+shards the stream has. Shards waiting their turn cost only a small scheduling
+entry; idle shards back off exponentially between polls (capped at 5s), so a
+stream with thousands of low-traffic shards is neither buffered nor polled at
+full rate. Lease heartbeats run outside the pool, so waiting shards keep their
+leases. It changes no delivery semantics: at-least-once, per-item ordering, and
+per-shard ordering all hold (a shard is never split; each shard is processed by
+one pool worker at a time). Leave it unset for the prior behavior (one
+concurrent task per shard). The trade-off: with many active shards and a small
+pool, a cold shard waits longer between polls (higher iterator age) — the value
+is a footprint-vs-latency dial.
 
 ## Record format: typed by default, native or DynamoDB JSON views
 

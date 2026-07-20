@@ -156,8 +156,11 @@ Apache-2.0.
 
 ## Bounding footprint
 
-`WorkerConfig.Builder.maxProcessingConcurrency(int)` (optional) caps the number
-of shards processed concurrently, keeping footprint O(max) as the table's
-shard count grows. Unset = one processing slot per shard. Bounds
-concurrent record delivery only; at-least-once, per-item, and per-shard ordering
-are preserved.
+`WorkerConfig.Builder.maxProcessingConcurrency(int)` (optional) caps the total
+number of shards fetched, buffered, and processed at once, so the worker's
+footprint is O(max) independent of the stream's shard count. Unset = one
+concurrent task per shard. Waiting shards cost only a scheduling entry; idle
+shards back off between polls; lease heartbeats run outside the pool so waiting
+shards keep their leases. At-least-once, per-item, and per-shard ordering are
+preserved. Trade-off: a small pool over many active shards raises cold-shard
+poll latency (iterator age).

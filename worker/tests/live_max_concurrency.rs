@@ -37,6 +37,15 @@ use std::time::Duration;
 const CAP: usize = 4;
 const N_WRITES: usize = 200;
 
+/// Env-overridable numeric knob (used to point the warm pre-split at the
+/// account's current warm-throughput ceiling for scale runs).
+fn env_u64(key: &str, default: u64) -> i64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default) as i64
+}
+
 /// Records live processing concurrency + per-shard delivery order.
 struct ConcConsumer {
     shard: ShardId,
@@ -131,8 +140,8 @@ async fn live_max_processing_concurrency_bounds_and_preserves_order() {
         .billing_mode(BillingMode::PayPerRequest)
         .warm_throughput(
             WarmThroughput::builder()
-                .read_units_per_second(12_000)
-                .write_units_per_second(20_000)
+                .read_units_per_second(env_u64("DDB_STREAMS_CONSUMER_IT_WARM_READS", 12_000))
+                .write_units_per_second(env_u64("DDB_STREAMS_CONSUMER_IT_WARM_WRITES", 20_000))
                 .build(),
         )
         .stream_specification(

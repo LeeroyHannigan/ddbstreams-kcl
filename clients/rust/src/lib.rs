@@ -411,16 +411,21 @@ impl WorkerBuilder {
         self
     }
 
-    /// Cap the number of shards this worker **processes concurrently** (opt-in).
+    /// Bound this worker's **total footprint** to a processing pool of `max`
+    /// workers (opt-in).
     ///
-    /// Unset (the default) keeps one processing slot per owned shard, so a
-    /// worker's footprint grows with the stream's shard count. Setting
-    /// `max` bounds concurrent record delivery to `max`, making footprint O(max)
-    /// independent of shard count, while preserving at-least-once delivery,
-    /// per-item ordering, and per-shard ordering (a shard is never split; each
-    /// shard is processed by one slot at a time). Shard reads and lease
-    /// heartbeats are not gated, so idle shards keep their leases. `0` is treated
-    /// as unset (unbounded).
+    /// Unset (the default) runs one concurrent task per owned shard, so a
+    /// worker's footprint grows with the stream's shard count. Setting `max`
+    /// runs a fixed pool of `max` workers that fetch, buffer, deliver, and
+    /// checkpoint due shards — in-flight `GetRecords` calls, batch buffers,
+    /// and processing contexts are all O(`max`), independent of shard count.
+    /// Waiting shards cost only a scheduling entry; idle shards back off
+    /// between polls; lease heartbeats run outside the pool so waiting shards
+    /// keep their leases. At-least-once delivery, per-item ordering, and
+    /// per-shard ordering are preserved (a shard is never split; each shard
+    /// is processed by one pool worker at a time). The trade-off: a small
+    /// pool over many active shards raises cold-shard poll latency (iterator
+    /// age). `0` is treated as unset (unbounded).
     pub fn max_processing_concurrency(mut self, max: usize) -> Self {
         self.max_processing_concurrency = Some(max);
         self

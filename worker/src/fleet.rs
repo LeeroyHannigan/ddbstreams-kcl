@@ -21,10 +21,9 @@ use amazon_dynamodb_streams_consumer_core::metrics::{noop_sink, ShardMetrics, Sh
 use amazon_dynamodb_streams_consumer_core::{
     child_seed_checkpoint, InitialPosition, ShardId, StartPosition,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::Semaphore;
+use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 
 pub struct FleetConfig {
@@ -141,23 +140,81 @@ pub struct Fleet<S, L> {
     /// Metrics sink (default no-op). Emits per-batch lag/throughput,
     /// shard-lifecycle, and DescribeStream events. Set via [`Fleet::with_metrics`].
     metrics: SharedMetricsSink,
-    /// Optional cap on the number of shards whose records are **processed**
-    /// (delivered to the customer consumer) concurrently, across this worker.
-    /// `None` ⇒ unbounded (one processing slot per owned shard — the default,
-    /// behavior-identical to prior releases). `Some(k)` ⇒ at most `k` concurrent
-    /// `deliver` calls; shard *reading* (GetRecords) and lease heartbeats stay
-    /// unbounded, so idle shards keep their leases while queued to process.
-    /// Set via [`Fleet::with_max_processing_concurrency`]. See `docs/multiplexing-design.md`.
+    /// Optional bound on this worker's processing pool. `None` ⇒ unbounded
+    /// (one concurrent task per owned shard — the default, behavior-identical
+    /// to prior releases). `Some(k)` ⇒ a fixed pool of `k` workers fetches,
+    /// delivers, and checkpoints due shards, so the worker's **total**
+    /// footprint (in-flight GetRecords, batches, consumers) is O(k),
+    /// independent of the stream's shard count. Idle shards cost only a
+    /// registry entry and back off exponentially between polls. Lease
+    /// keep-alive for queued shards runs outside the pool, so waiting shards
+    /// are never reaped. Set via [`Fleet::with_max_processing_concurrency`].
     processing_limit: Option<Arc<ProcessingLimit>>,
+    /// Per-shard poll schedule for the bounded path (idle backoff), persisted
+    /// across coordination cycles. Unused (empty) when unbounded.
+    sched: Arc<std::sync::Mutex<HashMap<ShardId, ShardSched>>>,
 }
 
-/// A processing-concurrency cap: a permit pool (`sem`) plus the configured
-/// maximum (`max`) tracked explicitly, since [`Semaphore`] does not expose its
-/// own ceiling (only currently-free permits). `max` is the source of truth for
-/// [`Fleet::set_max_processing_concurrency`] resizes.
+/// The bounded-processing pool size: the number of pool workers that fetch,
+/// deliver, and checkpoint shards concurrently. This is the worker's **total
+/// footprint bound** — batches, consumers, and in-flight GetRecords are all
+/// O(`max`), independent of the stream's shard count. Tracked as an atomic so
+/// [`Fleet::set_max_processing_concurrency`] can resize it online (takes
+/// effect at the next coordination cycle).
 struct ProcessingLimit {
-    sem: Semaphore,
     max: std::sync::atomic::AtomicUsize,
+}
+
+/// Per-shard scheduling state for the bounded (pool) path, persisted across
+/// coordination cycles. Idle shards back off exponentially so a stream with
+/// thousands of low-RPS shards is not polled at full rate every cycle; active
+/// shards stay hot (backoff 0 ⇒ always due).
+struct ShardSched {
+    /// Current idle backoff in ms; 0 ⇒ the shard was active on its last pass.
+    backoff_ms: u64,
+    /// The shard is polled only at/after this instant.
+    due_at: Instant,
+    /// Last time this worker touched the shard's lease (pass, queue keep-alive,
+    /// or deferred renewal). Drives keep-alive so a deferred/queued shard is
+    /// never reaped while waiting.
+    last_liveness: Instant,
+}
+
+/// Ceiling for the idle-poll backoff, regardless of `poll_interval_ms`.
+const MAX_IDLE_BACKOFF_MS: u64 = 5_000;
+
+/// A unit of pool work: one shard pass, queued for a pool worker. The lease
+/// counter travels WITH the item: the keep-alive task removes an item from the
+/// queue before renewing (and reinserts it with the advanced counter), so a
+/// pool worker can never claim a shard whose counter is being advanced under
+/// it — that would read as a false lease loss at checkpoint time.
+struct PoolItem {
+    shard: ShardId,
+    counter: u64,
+    checkpoint: Option<String>,
+    enqueued: Instant,
+    last_renewed: Instant,
+}
+
+/// Queue shared between the enqueue step, the `k` pool workers, and the lease
+/// keep-alive task. `renewing` counts items temporarily extracted for renewal;
+/// workers only terminate when the queue is empty AND nothing is mid-renewal
+/// (a renewed item re-enters the queue).
+struct PoolState {
+    queue: std::collections::VecDeque<PoolItem>,
+    renewing: usize,
+}
+
+/// What a single shard pass observed — drives the idle-backoff schedule.
+enum PassOutcome {
+    /// Records were delivered this pass (shard is hot — poll again promptly).
+    Active,
+    /// No records at all (idle — back off exponentially).
+    Idle,
+    /// SHARD_END reached and marked complete (drop from the schedule).
+    Ended,
+    /// Lease lost or delivery failed (drop; ownership resolves next cycle).
+    Stopped,
 }
 
 /// Shard-sync progress tracked by the leader so it can avoid full `DescribeStream`
@@ -191,6 +248,7 @@ where
             sync_state: std::sync::Mutex::new(SyncState::default()),
             metrics: noop_sink(),
             processing_limit: None,
+            sched: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -201,23 +259,28 @@ where
         self
     }
 
-    /// Bound the number of shards **processed concurrently** to `max` (opt-in).
+    /// Bound this worker's **total footprint** to a fixed processing pool of
+    /// `max` workers (opt-in).
     ///
-    /// `None` (the default) keeps prior behavior: one processing slot per owned
+    /// `None` (the default) keeps prior behavior: one concurrent task per owned
     /// shard, so per-worker footprint grows with the stream's shard count.
-    /// `Some(k)` (k ≥ 1) caps concurrent customer `deliver` calls at `k`, making
-    /// footprint O(k) independent of shard count while preserving at-least-once,
-    /// per-item, and per-shard ordering (a shard is never split; each shard task
-    /// is sequential and holds at most one permit). `Some(0)` is treated as
-    /// `None` (unbounded) rather than deadlocking.
+    /// `Some(k)` (k ≥ 1) runs a fixed pool of `k` workers that fetch, deliver,
+    /// and checkpoint due shards — in-flight GetRecords calls, batch buffers,
+    /// and live consumers are all O(k), independent of shard count. Idle shards
+    /// cost only a small registry entry and back off exponentially between
+    /// polls (capped at 5s), so a stream with thousands of low-RPS shards is
+    /// neither buffered nor polled at full rate. At-least-once, per-item, and
+    /// per-shard ordering are preserved: a shard is never split, and at most
+    /// one pool worker holds a shard at a time. `Some(0)` is treated as `None`
+    /// (unbounded) rather than deadlocking.
     ///
-    /// Reading (GetRecords) and lease heartbeats are intentionally *not* gated,
-    /// so a shard queued for a processing slot keeps its lease and an idle shard
-    /// never contends for a permit.
+    /// Lease keep-alive for shards waiting on the pool runs outside it, so a
+    /// queued shard keeps its lease. The trade-off: with `N` due shards and a
+    /// pool of `k`, a cold shard's poll latency (IteratorAge) grows with `N/k`
+    /// — `k` is the footprint-vs-latency dial.
     pub fn with_max_processing_concurrency(mut self, max: Option<usize>) -> Self {
         self.processing_limit = match max {
             Some(k) if k >= 1 => Some(Arc::new(ProcessingLimit {
-                sem: Semaphore::new(k),
                 max: std::sync::atomic::AtomicUsize::new(k),
             })),
             _ => None,
@@ -225,34 +288,20 @@ where
         self
     }
 
-    /// Online resize of the processing-concurrency cap on a running fleet.
+    /// Online resize of the processing pool on a running fleet.
     ///
-    /// Grow adds permits immediately; shrink removes the delta at the next batch
-    /// boundary (it waits for in-flight slots to free, then forgets them), so it
-    /// never interrupts an in-flight `deliver`. Only adjusts a fleet that was
-    /// created bounded (`with_max_processing_concurrency(Some(_))`); switching an
-    /// unbounded fleet to bounded at runtime is unsupported (returns without
-    /// effect) because the slot set is fixed at construction. Call from a single
-    /// controller task (concurrent resizes are not serialized against each other).
+    /// Takes effect at the next coordination cycle (the pool is sized per
+    /// cycle): grow adds workers, shrink drops them — no in-flight `deliver` is
+    /// ever interrupted, because a cycle's pool workers always finish their
+    /// current shard pass. Only adjusts a fleet that was created bounded
+    /// (`with_max_processing_concurrency(Some(_))`); switching an unbounded
+    /// fleet to bounded at runtime is unsupported (returns without effect).
     pub async fn set_max_processing_concurrency(&self, target: usize) {
         use std::sync::atomic::Ordering;
         let Some(pl) = self.processing_limit.as_ref() else {
             return; // unbounded fleet: nothing to resize
         };
-        let target = target.max(1);
-        let current = pl.max.load(Ordering::SeqCst);
-        if target > current {
-            pl.sem.add_permits(target - current);
-            pl.max.store(target, Ordering::SeqCst);
-        } else if target < current {
-            let take = (current - target) as u32;
-            // Waits for `take` permits to be free (an in-flight deliver keeps its
-            // permit until its batch completes), then permanently removes them.
-            if let Ok(permits) = pl.sem.acquire_many(take).await {
-                permits.forget();
-                pl.max.store(target, Ordering::SeqCst);
-            }
-        }
+        pl.max.store(target.max(1), Ordering::SeqCst);
     }
 
     /// Run coordination cycles until every shard's lease is complete or
@@ -359,8 +408,13 @@ where
         // been GC'd (see cleanup pass) and counts as satisfied for its children.
         let existing: HashSet<ShardId> = shards.iter().map(|m| m.id.clone()).collect();
 
-        // 3) Run one concurrent task per owned + eligible shard.
-        let mut set: JoinSet<()> = JoinSet::new();
+        // 3) Process owned + eligible shards.
+        //    Unbounded (`None`): one concurrent task per shard (prior behavior).
+        //    Bounded (`Some(k)`): a fixed pool of `k` workers drains a due-shard
+        //    queue — total in-flight fetch/deliver/checkpoint is O(k) regardless
+        //    of how many shards this worker owns.
+        let now = Instant::now();
+        let mut eligible_owned: Vec<(ShardId, u64, Option<String>)> = Vec::new();
         for meta in &shards {
             let Some((counter, checkpoint)) = owned.get(&meta.id).cloned() else {
                 continue;
@@ -368,24 +422,242 @@ where
             if !eligible(meta, &completed, &existing) {
                 continue;
             }
+            eligible_owned.push((meta.id.clone(), counter, checkpoint));
+        }
+
+        match self.processing_limit.as_ref() {
+            None => {
+                let mut set: JoinSet<()> = JoinSet::new();
+                for (shard, counter, checkpoint) in eligible_owned {
+                    let src = self.source.clone();
+                    let lease = self.leases.clone();
+                    let consumer = self.factory.create(&shard);
+                    let task = ShardTask {
+                        owner: self.config.owner.clone(),
+                        shard,
+                        counter,
+                        checkpoint,
+                        poll_interval_ms: self.config.poll_interval_ms,
+                        metrics: self.metrics.clone(),
+                    };
+                    set.spawn(async move {
+                        let _ = process_shard(src, lease, consumer, task).await;
+                    });
+                }
+                while set.join_next().await.is_some() {}
+            }
+            Some(pl) => {
+                let k = pl.max.load(std::sync::atomic::Ordering::SeqCst).max(1);
+                self.run_bounded_pool(eligible_owned, k, now).await;
+            }
+        }
+        Ok(false)
+    }
+
+    /// Bounded path for one coordination cycle: run `k` pool workers over the
+    /// due subset of this worker's owned shards.
+    ///
+    /// Footprint: at most `k` shard passes (GetRecords + batch + consumer +
+    /// checkpoint) exist at any instant. Shards not yet due (idle backoff)
+    /// cost nothing this cycle. Shards queued behind the pool are kept alive
+    /// by a keep-alive task that renews their leases outside the pool.
+    async fn run_bounded_pool(
+        &self,
+        eligible_owned: Vec<(ShardId, u64, Option<String>)>,
+        k: usize,
+        now: Instant,
+    ) {
+        use std::collections::VecDeque;
+
+        // Refresh the schedule: keep entries for shards we still own, add new
+        // ones (immediately due), and select the due subset for this cycle.
+        let mut due: VecDeque<PoolItem> = VecDeque::new();
+        {
+            let mut sched = self.sched.lock().expect("sched mutex poisoned");
+            let owned_now: HashSet<&ShardId> = eligible_owned.iter().map(|(s, _, _)| s).collect();
+            sched.retain(|s, _| owned_now.contains(s));
+            for (shard, counter, checkpoint) in eligible_owned {
+                let entry = sched.entry(shard.clone()).or_insert(ShardSched {
+                    backoff_ms: 0,
+                    due_at: now,
+                    last_liveness: now,
+                });
+                if entry.due_at <= now {
+                    due.push_back(PoolItem {
+                        shard,
+                        counter,
+                        checkpoint,
+                        enqueued: now,
+                        last_renewed: now,
+                    });
+                }
+            }
+        }
+        if due.is_empty() {
+            // Nothing due: sleep to the earliest due_at (capped) so a cycle
+            // over an all-idle shard set doesn't spin.
+            let next = {
+                let sched = self.sched.lock().expect("sched mutex poisoned");
+                sched.values().map(|e| e.due_at).min()
+            };
+            if let Some(next) = next {
+                let wait = next.saturating_duration_since(Instant::now());
+                let cap = Duration::from_millis(self.config.poll_interval_ms.max(1));
+                tokio::time::sleep(wait.min(cap)).await;
+            }
+            return;
+        }
+
+        let pool = Arc::new(std::sync::Mutex::new(PoolState {
+            queue: due,
+            renewing: 0,
+        }));
+        let outcomes: Arc<std::sync::Mutex<Vec<(ShardId, PassOutcome)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let done = Arc::new(tokio::sync::Notify::new());
+
+        // Keep-alive: renew leases of shards WAITING in the queue so they are
+        // never reaped while queued behind the pool. An item is extracted,
+        // renewed, and reinserted with its advanced counter — a pool worker can
+        // therefore never claim a counter that is mid-renewal.
+        let keepalive = {
+            let pool = pool.clone();
+            let leases = self.leases.clone();
+            let owner = self.config.owner.clone();
+            let done = done.clone();
+            // Renew a queued shard once it has waited a third of the lease
+            // duration — early enough that even a slow renewal never races the
+            // lease expiry.
+            let renew_after = Duration::from_millis((self.config.lease_duration_ms / 3).max(1));
+            let tick = Duration::from_millis((self.config.lease_duration_ms / 6).clamp(1, 1_000));
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = done.notified() => return,
+                        _ = tokio::time::sleep(tick) => {}
+                    }
+                    // Extract every stale item in one lock, renew without the
+                    // lock, reinsert (preserving arrival order among renewed).
+                    let now = Instant::now();
+                    let stale: Vec<PoolItem> = {
+                        let mut st = pool.lock().expect("pool mutex poisoned");
+                        let mut keep = VecDeque::with_capacity(st.queue.len());
+                        let mut stale = Vec::new();
+                        while let Some(item) = st.queue.pop_front() {
+                            if now.duration_since(item.last_renewed) >= renew_after {
+                                stale.push(item);
+                            } else {
+                                keep.push_back(item);
+                            }
+                        }
+                        st.queue = keep;
+                        st.renewing += stale.len();
+                        stale
+                    };
+                    let extracted = stale.len();
+                    let mut renewed = Vec::with_capacity(extracted);
+                    for mut item in stale {
+                        if let Ok(c) = leases.renew(&item.shard, &owner, item.counter).await {
+                            item.counter = c;
+                            item.last_renewed = Instant::now();
+                            renewed.push(item);
+                        }
+                        // Renewal failure = lease lost while queued: drop the
+                        // item; ownership resolves next cycle from the table.
+                    }
+                    let mut st = pool.lock().expect("pool mutex poisoned");
+                    st.renewing -= extracted.min(st.renewing);
+                    for item in renewed {
+                        st.queue.push_back(item);
+                    }
+                }
+            })
+        };
+
+        // The pool: k workers, each looping { claim due shard → one pass }.
+        let mut set: JoinSet<()> = JoinSet::new();
+        for _ in 0..k {
+            let pool = pool.clone();
+            let outcomes = outcomes.clone();
             let src = self.source.clone();
             let lease = self.leases.clone();
-            let consumer = self.factory.create(&meta.id);
-            let task = ShardTask {
-                owner: self.config.owner.clone(),
-                shard: meta.id.clone(),
-                counter,
-                checkpoint,
-                poll_interval_ms: self.config.poll_interval_ms,
-                metrics: self.metrics.clone(),
-                limit: self.processing_limit.clone(),
-            };
+            let factory = self.factory.clone();
+            let owner = self.config.owner.clone();
+            let metrics = self.metrics.clone();
+            let poll_interval_ms = self.config.poll_interval_ms;
             set.spawn(async move {
-                let _ = process_shard(src, lease, consumer, task).await;
+                loop {
+                    let item = {
+                        let mut st = pool.lock().expect("pool mutex poisoned");
+                        match st.queue.pop_front() {
+                            Some(it) => Some(it),
+                            // Empty but items are mid-renewal: they'll re-enter;
+                            // yield and retry rather than exiting early.
+                            None if st.renewing > 0 => None,
+                            None => break,
+                        }
+                    };
+                    let Some(item) = item else {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        continue;
+                    };
+                    metrics.on_processing_slot_wait(
+                        &item.shard,
+                        item.enqueued.elapsed().as_millis() as u64,
+                    );
+                    let consumer = factory.create(&item.shard);
+                    let task = ShardTask {
+                        owner: owner.clone(),
+                        shard: item.shard.clone(),
+                        counter: item.counter,
+                        checkpoint: item.checkpoint,
+                        poll_interval_ms,
+                        metrics: metrics.clone(),
+                    };
+                    let outcome = process_shard(src.clone(), lease.clone(), consumer, task)
+                        .await
+                        .unwrap_or(PassOutcome::Stopped);
+                    outcomes
+                        .lock()
+                        .expect("outcomes mutex poisoned")
+                        .push((item.shard, outcome));
+                }
             });
         }
         while set.join_next().await.is_some() {}
-        Ok(false)
+        done.notify_waiters();
+        keepalive.abort();
+
+        // Fold pass outcomes into the schedule: hot shards stay immediately
+        // due; idle shards back off exponentially (capped); ended/stopped
+        // shards leave the schedule.
+        let now = Instant::now();
+        let mut sched = self.sched.lock().expect("sched mutex poisoned");
+        for (shard, outcome) in outcomes.lock().expect("outcomes mutex poisoned").drain(..) {
+            match outcome {
+                PassOutcome::Active => {
+                    if let Some(e) = sched.get_mut(&shard) {
+                        e.backoff_ms = 0;
+                        e.due_at = now;
+                        e.last_liveness = now;
+                    }
+                }
+                PassOutcome::Idle => {
+                    if let Some(e) = sched.get_mut(&shard) {
+                        e.backoff_ms = if e.backoff_ms == 0 {
+                            self.config.poll_interval_ms.max(1)
+                        } else {
+                            (e.backoff_ms * 2).min(MAX_IDLE_BACKOFF_MS)
+                        };
+                        e.due_at = now + Duration::from_millis(e.backoff_ms);
+                        e.last_liveness = now;
+                    }
+                }
+                PassOutcome::Ended | PassOutcome::Stopped => {
+                    sched.remove(&shard);
+                }
+            }
+        }
     }
 
     /// Leader-only shard discovery. Publishes newly-eligible shards as leases
@@ -585,20 +857,18 @@ struct ShardTask {
     checkpoint: Option<String>,
     poll_interval_ms: u64,
     metrics: SharedMetricsSink,
-    /// Shared processing-concurrency cap (`None` ⇒ unbounded). A permit is held
-    /// only around `deliver` (+ its checkpoint), not around GetRecords/heartbeat.
-    limit: Option<Arc<ProcessingLimit>>,
 }
 
 /// Drive a single shard: deliver records in order, checkpoint/heartbeat under the
 /// optimistic lock, complete at SHARD_END. Exits on lease loss or when the shard
-/// yields no data (one pass, for the drain model).
+/// yields no data (one pass, for the drain model). Returns what the pass
+/// observed so the bounded pool can schedule the shard's next poll.
 async fn process_shard<S, L>(
     source: Arc<S>,
     leases: Arc<L>,
     mut consumer: Box<dyn AsyncShardConsumer + Send>,
     task: ShardTask,
-) -> Result<(), WorkerError>
+) -> Result<PassOutcome, WorkerError>
 where
     S: AsyncStreamSource,
     L: AsyncLeaseStore,
@@ -610,36 +880,18 @@ where
         checkpoint,
         poll_interval_ms,
         metrics,
-        limit,
     } = task;
     // Resume from the lease's persisted checkpoint (None = TRIM_HORIZON for a
     // brand-new shard). This is what makes re-processing idempotent across
     // cycles and correct across a restart. (The consumer was initialized for
     // this shard by the factory.)
     let mut after: Option<String> = checkpoint;
+    let mut delivered_any = false;
     loop {
         let batch = source.get_records(&shard, after.clone()).await?;
         if !batch.records.is_empty() {
+            delivered_any = true;
             let last = batch.records.last().unwrap().seq.clone();
-            // Bound concurrent customer processing: acquire a slot before
-            // `deliver` and hold it across the checkpoint, releasing before the
-            // next GetRecords. `None` ⇒ unbounded (prior behavior). Reading and
-            // heartbeats are deliberately outside this permit. The semaphore is
-            // never closed, so acquire cannot fail.
-            let _permit = match limit.as_ref() {
-                Some(pl) => {
-                    let wait_start = Instant::now();
-                    let p = pl
-                        .sem
-                        .acquire()
-                        .await
-                        .expect("processing semaphore is never closed");
-                    metrics
-                        .on_processing_slot_wait(&shard, wait_start.elapsed().as_millis() as u64);
-                    Some(p)
-                }
-                None => None,
-            };
             // Deliver and let the consumer decide the checkpoint (its ack). A
             // sidecar returns the seq the client durably processed; the sync
             // in-process adapter returns the batch's last seq.
@@ -649,7 +901,7 @@ where
                     Err(_) => {
                         metrics.on_lease_lost(&shard);
                         let _ = consumer.lease_lost().await; // lease lost → notify + stop
-                        return Ok(());
+                        return Ok(PassOutcome::Stopped);
                     }
                 },
                 Ok(None) => {
@@ -660,11 +912,11 @@ where
                         Err(_) => {
                             metrics.on_lease_lost(&shard);
                             let _ = consumer.lease_lost().await;
-                            return Ok(());
+                            return Ok(PassOutcome::Stopped);
                         }
                     }
                 }
-                Err(_) => return Ok(()), // delivery failed → stop; lease expires
+                Err(_) => return Ok(PassOutcome::Stopped), // delivery failed; lease expires
             }
             // Record delivered-batch metrics: throughput + per-shard lag
             // (MillisBehindLatest). Emitted after successful delivery.
@@ -680,14 +932,18 @@ where
             let _ = consumer.shard_ended().await;
             let _ = leases.mark_complete(&shard, &owner, counter).await;
             metrics.on_shard_end(&shard);
-            return Ok(());
+            return Ok(PassOutcome::Ended);
         }
         if batch.records.is_empty() {
             // Idle: heartbeat to keep the lease (best-effort; drain model then
             // returns — a continuous consumer would keep looping with backoff).
             let _ = leases.renew(&shard, &owner, counter).await;
             let _ = poll_interval_ms;
-            return Ok(());
+            return Ok(if delivered_any {
+                PassOutcome::Active
+            } else {
+                PassOutcome::Idle
+            });
         }
     }
 }
@@ -1917,21 +2173,18 @@ mod tests {
 
     #[tokio::test]
     async fn set_max_processing_concurrency_grows_and_shrinks() {
-        // Online resize: grow adds permits immediately; shrink reclaims them
-        // (no in-flight permits here, so it takes effect at once).
+        // Online resize updates the pool-size source of truth; it takes effect
+        // at the next coordination cycle (the pool is sized per cycle).
         use std::sync::atomic::Ordering::SeqCst;
         let (fleet, _max, _delivered) = conc_fleet(1, Some(2));
         let pl = fleet.processing_limit.clone().unwrap();
-        assert_eq!(pl.sem.available_permits(), 2);
         assert_eq!(pl.max.load(SeqCst), 2);
 
         fleet.set_max_processing_concurrency(5).await;
-        assert_eq!(pl.sem.available_permits(), 5, "grew to 5 permits");
-        assert_eq!(pl.max.load(SeqCst), 5);
+        assert_eq!(pl.max.load(SeqCst), 5, "grew to a 5-worker pool");
 
         fleet.set_max_processing_concurrency(1).await;
-        assert_eq!(pl.sem.available_permits(), 1, "shrank to 1 permit");
-        assert_eq!(pl.max.load(SeqCst), 1);
+        assert_eq!(pl.max.load(SeqCst), 1, "shrank to a 1-worker pool");
     }
 
     #[tokio::test]
@@ -1998,17 +2251,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cap_no_permit_leak_on_ack_path() {
-        // After a run that acks every batch, all permits are returned (no leak
-        // would silently shrink effective concurrency over time).
+    async fn cap_no_state_leak_on_ack_path() {
+        // After a run that acks every batch, the schedule holds no live pool
+        // state (ended shards leave it) and a subsequent bounded run still
+        // completes — no cross-run leak that would shrink effective capacity.
         let (fleet, _max, _delivered) = conc_fleet(8, Some(3));
         fleet.run_until_complete(10).await.unwrap();
-        let pl = fleet.processing_limit.as_ref().unwrap();
-        assert_eq!(
-            pl.sem.available_permits(),
-            3,
-            "all permits returned after acked deliveries"
+        assert!(
+            fleet.sched.lock().unwrap().is_empty(),
+            "ended shards must leave the poll schedule"
         );
+        fleet.run_until_complete(10).await.unwrap(); // must not hang or panic
     }
 
     /// Consumer that delivers but never acks (returns `None`) — the sidecar
@@ -2033,7 +2286,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cap_no_permit_leak_on_none_ack_path() {
+    async fn cap_no_state_leak_on_none_ack_path() {
         let (metas, data) = roots(6);
         let fleet = Fleet::new(
             FakeSource { metas, data },
@@ -2048,13 +2301,9 @@ mod tests {
             },
         )
         .with_max_processing_concurrency(Some(2));
+        // A never-acking consumer must not wedge the pool: the run terminates
+        // (bounded cycles) and pool workers exit cleanly each cycle.
         fleet.run_until_complete(10).await.unwrap();
-        let pl = fleet.processing_limit.as_ref().unwrap();
-        assert_eq!(
-            pl.sem.available_permits(),
-            2,
-            "permit released even when the consumer never acks"
-        );
     }
 
     #[tokio::test]
@@ -2224,33 +2473,21 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn resize_shrink_waits_for_inflight() {
-        // Shrink must not preempt an in-flight slot: it blocks until a permit is
-        // free, then removes it. Hold both permits, request shrink→1, assert it
-        // stays pending until we release, then completes with max=1.
+    async fn resize_takes_effect_next_cycle() {
+        // Shrink never preempts an in-flight pass: the resize is a plain store
+        // read at each cycle start, so the current cycle's workers finish their
+        // shard passes and the NEXT cycle runs with the new pool size. Proven
+        // behaviorally: after shrinking 3 → 1, a fresh run never observes more
+        // than 1 concurrent delivery.
         use std::sync::atomic::Ordering::SeqCst;
-        let (fleet, _max, _delivered) = conc_fleet(1, Some(2));
-        let fleet = Arc::new(fleet);
-        let pl = fleet.processing_limit.clone().unwrap();
-
-        let held = pl.sem.acquire_many(2).await.unwrap(); // 0 permits free
-        let f2 = fleet.clone();
-        let mut shrink = tokio::spawn(async move { f2.set_max_processing_concurrency(1).await });
-
-        // With no free permit, the shrink cannot make progress.
-        let pending = tokio::time::timeout(std::time::Duration::from_millis(80), &mut shrink).await;
+        let (fleet, max, _delivered) = conc_fleet(6, Some(3));
+        fleet.set_max_processing_concurrency(1).await;
+        assert_eq!(fleet.processing_limit.as_ref().unwrap().max.load(SeqCst), 1);
+        fleet.run_until_complete(10).await.unwrap();
         assert!(
-            pending.is_err(),
-            "shrink must wait while permits are in-flight"
-        );
-
-        drop(held); // free both permits → shrink can reclaim one
-        shrink.await.unwrap();
-        assert_eq!(pl.max.load(SeqCst), 1, "max updated after shrink");
-        assert_eq!(
-            pl.sem.available_permits(),
-            1,
-            "one permit reclaimed, one remains"
+            max.load(SeqCst) <= 1,
+            "post-shrink run observed {} concurrent deliveries (pool=1)",
+            max.load(SeqCst)
         );
     }
 
@@ -2292,6 +2529,410 @@ mod tests {
             sink.slot_waits.lock().unwrap().len(),
             6,
             "one slot-wait sample per delivered batch (6 shards)"
+        );
+    }
+
+    // ---- bounded-pool (v2) invariants: fetch bound, backoff, keep-alive ----
+
+    /// Source that records the maximum number of CONCURRENT `get_records`
+    /// calls — the pool's new invariant. The v1 semaphore bounded only
+    /// `deliver`; the pool must bound the fetch (and its buffer) too.
+    struct FetchProbeSource {
+        inner: FakeSource,
+        cur: Arc<std::sync::atomic::AtomicUsize>,
+        max: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl AsyncStreamSource for FetchProbeSource {
+        async fn describe_shards(&self) -> Result<Vec<ShardMeta>, WorkerError> {
+            self.inner.describe_shards().await
+        }
+        async fn get_records(
+            &self,
+            shard: &str,
+            after: Option<String>,
+        ) -> Result<RecordBatch, WorkerError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.cur.fetch_add(1, SeqCst) + 1;
+            self.max.fetch_max(now, SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let out = self.inner.get_records(shard, after).await;
+            self.cur.fetch_sub(1, SeqCst);
+            out
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pool_bounds_concurrent_fetches() {
+        // THE v2 invariant: with a pool of k, at most k GetRecords calls (and
+        // therefore at most k batch buffers) are in flight — total footprint
+        // O(k), not O(shards). The v1 semaphore did not hold this.
+        let (metas, data) = roots(8);
+        let cur = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = FetchProbeSource {
+            inner: FakeSource { metas, data },
+            cur,
+            max: max.clone(),
+        };
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let factory = Arc::new(ConcFactory {
+            cur: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            delivered: delivered.clone(),
+        });
+        let fleet = Fleet::new(
+            source,
+            FakeLeases::default(),
+            factory,
+            FleetConfig {
+                owner: "w1".into(),
+                max_leases: 100,
+                lease_duration_ms: 100_000,
+                poll_interval_ms: 1,
+                initial_position: InitialPosition::default(),
+            },
+        )
+        .with_max_processing_concurrency(Some(2));
+        fleet.run_until_complete(10).await.unwrap();
+
+        let observed = max.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            observed <= 2,
+            "observed {observed} concurrent GetRecords calls; pool=2 must bound the fetch"
+        );
+        let mut got = delivered.lock().unwrap().clone();
+        got.sort();
+        got.dedup();
+        assert_eq!(got.len(), 8, "every shard still processed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unbounded_fetches_exceed_two_proving_probe_sensitivity() {
+        // Control for the fetch-bound test: the same probe under `None`
+        // observes > 2 concurrent fetches, so the bounded assertion above is
+        // measuring a real constraint rather than a blind spot in the probe.
+        let (metas, data) = roots(8);
+        let cur = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = FetchProbeSource {
+            inner: FakeSource { metas, data },
+            cur,
+            max: max.clone(),
+        };
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let factory = Arc::new(ConcFactory {
+            cur: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            delivered,
+        });
+        let fleet = Fleet::new(
+            source,
+            FakeLeases::default(),
+            factory,
+            FleetConfig {
+                owner: "w1".into(),
+                max_leases: 100,
+                lease_duration_ms: 100_000,
+                poll_interval_ms: 1,
+                initial_position: InitialPosition::default(),
+            },
+        );
+        fleet.run_until_complete(10).await.unwrap();
+        assert!(
+            max.load(std::sync::atomic::Ordering::SeqCst) > 2,
+            "unbounded run should overlap more than 2 fetches"
+        );
+    }
+
+    /// Source with one never-ending, always-empty shard — the thousands-of-
+    /// idle-shards profile in miniature. Counts polls to prove backoff.
+    struct IdleOpenSource {
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl AsyncStreamSource for IdleOpenSource {
+        async fn describe_shards(&self) -> Result<Vec<ShardMeta>, WorkerError> {
+            Ok(vec![ShardMeta {
+                id: "s0".into(),
+                parents: vec![],
+            }])
+        }
+        async fn get_records(
+            &self,
+            _shard: &str,
+            _after: Option<String>,
+        ) -> Result<RecordBatch, WorkerError> {
+            self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(RecordBatch {
+                records: vec![],
+                shard_end: false, // open shard: never completes
+                millis_behind_latest: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_shard_backs_off_across_cycles() {
+        // An idle open shard must NOT be polled once per cycle: its backoff
+        // doubles (poll_interval → 2x → 4x ..., capped), so over N cycles the
+        // poll count stays well under N. This is what collapses GetRecords
+        // volume for streams with thousands of trickle-RPS shards.
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = IdleOpenSource {
+            polls: polls.clone(),
+        };
+        let fleet = Fleet::new(
+            source,
+            FakeLeases::default(),
+            Arc::new(CapNoAckFactory),
+            FleetConfig {
+                owner: "w1".into(),
+                max_leases: 100,
+                lease_duration_ms: 100_000,
+                poll_interval_ms: 40,
+                initial_position: InitialPosition::default(),
+            },
+        )
+        .with_max_processing_concurrency(Some(2));
+        fleet.run_until_complete(12).await.unwrap();
+        let n = polls.load(std::sync::atomic::Ordering::SeqCst);
+        // 12 cycles; backoff 40→80→160→... means at most ~5 polls fit in the
+        // elapsed window. Anything ≥ 12 would mean no backoff at all.
+        assert!(
+            (1..=6).contains(&n),
+            "expected backed-off polling (1..=6 polls over 12 cycles), got {n}"
+        );
+    }
+
+    /// Lease store that ENFORCES the optimistic-lock counter (the real
+    /// DynamoDB store's contract; `FakeLeases` does not check it). Required to
+    /// prove the queue keep-alive keeps a waiting shard's counter coherent —
+    /// with a non-strict fake, a stale counter would silently pass.
+    #[derive(Default, Clone)]
+    struct StrictLeases {
+        rows: Arc<Mutex<HashMap<String, State>>>,
+    }
+    #[async_trait::async_trait]
+    impl AsyncLeaseStore for StrictLeases {
+        async fn get(&self, key: &str) -> Result<Option<LeaseView>, WorkerError> {
+            Ok(self.rows.lock().unwrap().get(key).map(|r| LeaseView {
+                completed: r.completed,
+            }))
+        }
+        async fn list(&self) -> Result<Vec<RawLease>, WorkerError> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(k, r)| RawLease {
+                    lease_key: k.clone(),
+                    owner: r.owner.clone(),
+                    lease_counter: r.counter,
+                    completed: r.completed,
+                    checkpoint: r.checkpoint.clone(),
+                    parents: r.parents.clone(),
+                })
+                .collect())
+        }
+        async fn acquire(&self, key: &str, owner: &str) -> Result<LeaseHandle, WorkerError> {
+            let mut rows = self.rows.lock().unwrap();
+            let r = rows.entry(key.to_string()).or_default();
+            r.owner = Some(owner.to_string());
+            r.counter += 1;
+            Ok(LeaseHandle {
+                owner: owner.to_string(),
+                counter: r.counter,
+                checkpoint: r.checkpoint.clone(),
+            })
+        }
+        async fn renew(&self, key: &str, o: &str, counter: u64) -> Result<u64, WorkerError> {
+            let mut rows = self.rows.lock().unwrap();
+            let r = rows.get_mut(key).ok_or("no lease")?;
+            if r.owner.as_deref() != Some(o) || r.counter != counter {
+                return Err("optimistic lock failed".into());
+            }
+            r.counter += 1;
+            Ok(r.counter)
+        }
+        async fn checkpoint(
+            &self,
+            key: &str,
+            o: &str,
+            counter: u64,
+            s: &str,
+        ) -> Result<u64, WorkerError> {
+            let mut rows = self.rows.lock().unwrap();
+            let r = rows.get_mut(key).ok_or("no lease")?;
+            if r.owner.as_deref() != Some(o) || r.counter != counter {
+                return Err("optimistic lock failed".into());
+            }
+            r.checkpoint = Some(s.to_string());
+            r.counter += 1;
+            Ok(r.counter)
+        }
+        async fn mark_complete(&self, key: &str, o: &str, counter: u64) -> Result<(), WorkerError> {
+            let mut rows = self.rows.lock().unwrap();
+            let r = rows.get_mut(key).ok_or("no lease")?;
+            if r.owner.as_deref() != Some(o) || r.counter != counter {
+                return Err("optimistic lock failed".into());
+            }
+            r.completed = true;
+            Ok(())
+        }
+        async fn release(&self, key: &str, o: &str, counter: u64) -> Result<(), WorkerError> {
+            let mut rows = self.rows.lock().unwrap();
+            let r = rows.get_mut(key).ok_or("no lease")?;
+            if r.owner.as_deref() != Some(o) || r.counter != counter {
+                return Err("optimistic lock failed".into());
+            }
+            r.owner = None;
+            r.counter += 1;
+            Ok(())
+        }
+        async fn delete_lease(&self, key: &str) -> Result<(), WorkerError> {
+            let mut rows = self.rows.lock().unwrap();
+            if rows.get(key).map(|r| r.completed).unwrap_or(false) {
+                rows.remove(key);
+            }
+            Ok(())
+        }
+        async fn create_shard_lease(
+            &self,
+            key: &str,
+            parents: &[ShardId],
+            checkpoint: Option<&str>,
+        ) -> Result<(), WorkerError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .entry(key.to_string())
+                .or_insert_with(|| State {
+                    parents: parents.to_vec(),
+                    checkpoint: checkpoint.map(|s| s.to_string()),
+                    ..Default::default()
+                });
+            Ok(())
+        }
+        async fn try_acquire_leadership(
+            &self,
+            key: &str,
+            owner: &str,
+            expected: Option<u64>,
+        ) -> Result<Option<u64>, WorkerError> {
+            let mut rows = self.rows.lock().unwrap();
+            match expected {
+                None => {
+                    if rows.contains_key(key) {
+                        return Ok(None);
+                    }
+                    rows.insert(
+                        key.to_string(),
+                        State {
+                            owner: Some(owner.to_string()),
+                            counter: 1,
+                            ..Default::default()
+                        },
+                    );
+                    Ok(Some(1))
+                }
+                Some(c) => match rows.get_mut(key) {
+                    Some(r) if r.counter == c => {
+                        r.owner = Some(owner.to_string());
+                        r.counter = c + 1;
+                        Ok(Some(c + 1))
+                    }
+                    _ => Ok(None),
+                },
+            }
+        }
+    }
+
+    /// Consumer whose deliver blocks long enough that a queued shard crosses
+    /// the keep-alive renewal threshold while waiting for the single slot.
+    struct SlowAckProbe {
+        delay_ms: u64,
+        delivered: Arc<Mutex<Vec<String>>>,
+        shard: String,
+    }
+    #[async_trait::async_trait]
+    impl AsyncShardConsumer for SlowAckProbe {
+        async fn deliver(&mut self, records: &[Record]) -> Result<Option<String>, WorkerError> {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            self.delivered.lock().unwrap().push(self.shard.clone());
+            Ok(records.last().map(|r| r.seq.clone()))
+        }
+        async fn shard_ended(&mut self) -> Result<(), WorkerError> {
+            Ok(())
+        }
+    }
+    struct SlowAckFactory {
+        delay_ms: u64,
+        delivered: Arc<Mutex<Vec<String>>>,
+    }
+    impl ShardConsumerFactory for SlowAckFactory {
+        fn create(&self, shard: &ShardId) -> Box<dyn AsyncShardConsumer + Send> {
+            Box::new(SlowAckProbe {
+                delay_ms: self.delay_ms,
+                delivered: self.delivered.clone(),
+                shard: shard.clone(),
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_shard_keeps_lease_and_counter_coherent_under_strict_locking() {
+        // Pool of 1, two data shards, STRICT optimistic-lock store, and a
+        // deliver slow enough (300ms > lease_duration/3 = 200ms) that the
+        // queued shard crosses the keep-alive renewal threshold while waiting.
+        // The keep-alive must renew the queued lease AND the pool item must
+        // carry the advanced counter — a stale counter would fail the strict
+        // checkpoint as a false lease loss and the second shard would never
+        // deliver. Both shards delivering + checkpointing proves coherence.
+        let (metas, data) = roots(2);
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let leases = StrictLeases::default();
+        let fleet = Fleet::new(
+            FakeSource { metas, data },
+            leases.clone(),
+            Arc::new(SlowAckFactory {
+                delay_ms: 300,
+                delivered: delivered.clone(),
+            }),
+            FleetConfig {
+                owner: "w1".into(),
+                max_leases: 100,
+                lease_duration_ms: 600,
+                poll_interval_ms: 1,
+                initial_position: InitialPosition::default(),
+            },
+        )
+        .with_max_processing_concurrency(Some(1));
+        fleet.run_until_complete(6).await.unwrap();
+
+        let mut got = delivered.lock().unwrap().clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["s0".to_string(), "s1".to_string()],
+            "both shards delivered — queued shard survived the wait under strict locking"
+        );
+        let rows = leases.rows.lock().unwrap();
+        let dump: Vec<String> = rows
+            .iter()
+            .map(|(k, r)| {
+                format!(
+                    "{k}: owner={:?} counter={} completed={} ckpt={:?}",
+                    r.owner, r.counter, r.completed, r.checkpoint
+                )
+            })
+            .collect();
+        assert!(
+            rows.iter()
+                .filter(|(k, _)| k.as_str() != LEADER_LEASE_KEY)
+                .all(|(_, r)| r.completed && r.checkpoint.is_some()),
+            "both shards checkpointed and completed; rows: {dump:?}"
         );
     }
 }
