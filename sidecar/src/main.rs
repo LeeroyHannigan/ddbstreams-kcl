@@ -125,8 +125,9 @@ struct Config {
     graceful_shutdown_timeout_ms: u64,
     /// Optional GetRecords batch-size limit (None = service default).
     max_records: Option<i32>,
-    /// Optional cap on the number of shards processed concurrently
-    /// (None = unbounded, one processing slot per shard).
+    /// Optional bound on the processing pool: the total number of shards
+    /// fetched, buffered, and processed at once (None = unbounded, one
+    /// concurrent task per shard).
     max_processing_concurrency: Option<usize>,
     /// Billing mode + PITR applied when the lease table is auto-created.
     lease_table_config: LeaseTableConfig,

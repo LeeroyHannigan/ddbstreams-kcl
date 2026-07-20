@@ -86,10 +86,13 @@ environment (same as any AWS SDK).
 `cycle_interval_ms` — all optional keyword args on `Worker(...)`.
 
 `max_processing_concurrency` — optional keyword arg on `Worker(...)`. Caps the
-number of shards processed concurrently, so footprint stays O(max) as the
-stream's shard count grows. Unset = one processing slot per shard
-(prior behavior). Bounds concurrent record delivery only; at-least-once,
-per-item, and per-shard ordering are preserved.
+total number of shards fetched, buffered, and processed at once, so the
+worker's footprint is O(max) independent of the stream's shard count. Unset =
+one concurrent task per shard (prior behavior). Waiting shards cost only a
+scheduling entry; idle shards back off between polls; lease heartbeats run
+outside the pool so waiting shards keep their leases. At-least-once, per-item,
+and per-shard ordering are preserved. Trade-off: a small pool over many active
+shards raises cold-shard poll latency (iterator age).
 
 `initial_position` — optional keyword arg on `Worker(...)` controlling where a
 freshly-seeded shard begins reading. Values are `TRIM_HORIZON` (the default —
