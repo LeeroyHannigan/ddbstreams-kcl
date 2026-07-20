@@ -414,7 +414,7 @@ impl WorkerBuilder {
     /// Cap the number of shards this worker **processes concurrently** (opt-in).
     ///
     /// Unset (the default) keeps one processing slot per owned shard, so a
-    /// worker's footprint grows with the table's partition/shard count. Setting
+    /// worker's footprint grows with the stream's shard count. Setting
     /// `max` bounds concurrent record delivery to `max`, making footprint O(max)
     /// independent of shard count, while preserving at-least-once delivery,
     /// per-item ordering, and per-shard ordering (a shard is never split; each

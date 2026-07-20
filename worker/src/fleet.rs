@@ -204,7 +204,7 @@ where
     /// Bound the number of shards **processed concurrently** to `max` (opt-in).
     ///
     /// `None` (the default) keeps prior behavior: one processing slot per owned
-    /// shard, so per-worker footprint grows with the shard/partition count.
+    /// shard, so per-worker footprint grows with the stream's shard count.
     /// `Some(k)` (k ≥ 1) caps concurrent customer `deliver` calls at `k`, making
     /// footprint O(k) independent of shard count while preserving at-least-once,
     /// per-item, and per-shard ordering (a shard is never split; each shard task

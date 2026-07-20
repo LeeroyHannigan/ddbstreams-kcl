@@ -127,6 +127,6 @@ Runs native-decoding unit tests plus the shared binding **conformance** suite
 
 `Config.MaxProcessingConcurrency` (optional; 0 = unbounded) caps the number of
 shards processed concurrently, keeping footprint O(max) as the table's
-shard/partition count grows. Unset = one processing slot per shard. Bounds
+shard count grows. Unset = one processing slot per shard. Bounds
 concurrent record delivery only; at-least-once, per-item, and per-shard ordering
 are preserved.

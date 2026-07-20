@@ -74,8 +74,8 @@ workers automatically.
 ## Bounding footprint: `max_processing_concurrency`
 
 By default the worker processes one shard per concurrent slot, so its footprint
-grows with the table's partition/shard count. To keep footprint constant as a
-table accumulates partitions, cap the number of shards processed concurrently:
+grows with the stream's shard count. To keep footprint constant as a
+stream accumulates shards, cap the number of shards processed concurrently:
 
 ```rust
 let worker = Worker::builder()

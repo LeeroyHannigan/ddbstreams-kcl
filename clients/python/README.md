@@ -87,7 +87,7 @@ environment (same as any AWS SDK).
 
 `max_processing_concurrency` — optional keyword arg on `Worker(...)`. Caps the
 number of shards processed concurrently, so footprint stays O(max) as the
-table's shard/partition count grows. Unset = one processing slot per shard
+stream's shard count grows. Unset = one processing slot per shard
 (prior behavior). Bounds concurrent record delivery only; at-least-once,
 per-item, and per-shard ordering are preserved.
 

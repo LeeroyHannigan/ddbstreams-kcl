@@ -1,7 +1,7 @@
 # Multiplexing (`maxProcessingConcurrency`) — Design Spec
 
 **Status:** Design locked; API pending bar-raiser (Remy).
-**Scope:** `amazon-dynamodb-streams-consumer` — let a customer *optionally* bound processing concurrency so footprint stays constant as partition/shard count grows, with **no change to delivery or ordering semantics**.
+**Scope:** `amazon-dynamodb-streams-consumer` — let a customer *optionally* bound processing concurrency so footprint stays constant as the stream's shard count grows, with **no change to delivery or ordering semantics**.
 **Author:** Lee Hannigan · **Reviewers:** Amrith Kumar, Watty (Streams PM), Remy (API)
 
 ---
@@ -19,7 +19,7 @@ This spec routes **whole shards**, never item keys. A shard is never split, so t
 
 ## 1. Problem
 
-DynamoDB Streams exposes **one shard per table partition**. KCL / the KCL adapter map **one processing lane (thread + prefetch buffers + processor) per shard**. Aged/large tables accrete hundreds of low-RPS partitions → hundreds of lanes → footprint grows with *partition history*, not the customer's throughput or cores.
+A DynamoDB stream for a busy or long-lived table has many shards. KCL / the KCL adapter map **one processing lane (thread + prefetch buffers + processor) per shard**, so a stream with hundreds of low-RPS shards forces hundreds of lanes → footprint grows with the **stream's shard count**, not the customer's throughput or cores.
 
 Measured (44-shard table, same host): KCL 3.4.3 + KCA ≈ **1.2 GB RSS / 124 threads**, growing with shard count. This feature makes that curve flat and **customer-controlled**.
 
@@ -83,7 +83,7 @@ This is a surgical change to a tested fleet (`worker/src/fleet.rs` + `process_sh
 | Executor contexts | O(shards) | **O(k)** |
 | In-flight buffers | O(shards × prefetch) | **O(global credit budget)** |
 | Reader tasks | O(shards), ~KB each | O(shards), ~KB each (negligible) |
-| Grows as partitions grow? | **yes** | **no** |
+| Grows as the stream's shard count grows? | **yes** | **no** |
 
 ---
 
