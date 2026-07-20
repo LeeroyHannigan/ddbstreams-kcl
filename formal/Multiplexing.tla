@@ -1,97 +1,178 @@
 ---------------------------- MODULE Multiplexing ----------------------------
 (***************************************************************************)
 (* Formal model of `max_processing_concurrency` (multiplexing) in the      *)
-(* amazon-dynamodb-streams-consumer worker.                                *)
-(*                                                                         *)
-(* Abstraction: a worker owns a set of Shards. Each shard is processed     *)
-(* strictly in sequence (records 1..MaxSeq). A shared pool of `Cap`        *)
-(* processing slots bounds how many shards deliver concurrently — this is  *)
-(* exactly the tokio Semaphore in `process_shard`. Processing a record     *)
-(* delivers it and advances a DURABLE per-shard checkpoint by one. A crash *)
-(* while processing frees the slot WITHOUT advancing the checkpoint, so    *)
-(* the record is redelivered later (at-least-once), never lost.            *)
-(*                                                                         *)
-(* Properties checked (see Multiplexing.cfg):                              *)
-(*   BoundOK      - never more than Cap shards processing at once.         *)
-(*   CheckpointOK - durable progress stays within 0..MaxSeq (never skips). *)
-(*   AtLeastOnce  - every checkpointed record was delivered >= once.       *)
-(*   Termination  - every shard is eventually fully processed (no          *)
-(*                  starvation, no permanent loss) under fair scheduling.  *)
+(* amazon-dynamodb-streams-consumer worker, covering the full feature:      *)
+(*                                                                          *)
+(*   - a shared per-worker pool of `cap[w]` processing slots (the tokio     *)
+(*     Semaphore in `process_shard`) bounds concurrent delivery;            *)
+(*   - ONLINE RESIZE of that cap (`set_max_processing_concurrency`): grow   *)
+(*     freely, shrink never below the in-flight count (shrink waits for a   *)
+(*     slot to free), so the bound is never violated across a resize;       *)
+(*   - MULTI-WORKER lease ownership: each shard is owned by <= 1 worker;    *)
+(*     only the owner processes it, giving global mutual exclusion (no      *)
+(*     split-brain) with a per-worker cap; leases are lost on crash or      *)
+(*     handed off at a batch boundary (steal/expiry);                        *)
+(*   - RESHARD: a child shard is gated on its parent completing             *)
+(*     (parent-before-child), and is never split across slots;             *)
+(*   - CHECKPOINT/at-least-once across crash + lease handoff.               *)
+(*                                                                          *)
+(* Properties (see Multiplexing.cfg):                                       *)
+(*   PerWorkerBound  - each worker runs <= cap[w] shards at once, always,   *)
+(*                     including during/after an online resize.             *)
+(*   MutualExclusion - no shard is processed by two workers at once.        *)
+(*   OwnedWhileProc  - a shard in flight on w is owned by w.                *)
+(*   ParentBeforeChild - a child is only processed after its parent done.   *)
+(*   CheckpointOK    - per-shard checkpoint stays in 0..MaxSeq, never skips. *)
+(*   AtLeastOnce     - every checkpointed record was delivered >= once.     *)
+(*   Termination     - every shard (incl. children) is eventually fully     *)
+(*                     processed: no starvation, no permanent loss.         *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
-CONSTANTS Shards, Cap, MaxSeq, MaxCrashes
+CONSTANTS
+    MaxSeq,      \* records per shard
+    MaxCap,      \* max processing-concurrency cap a worker may be resized to
+    MaxCrashes,  \* bound on crash actions (keeps the state space finite)
+    MaxHandoffs  \* bound on voluntary lease handoffs (steal/expiry)
 
-ASSUME CapOK     == Cap \in Nat /\ Cap >= 1
-ASSUME MaxSeqOK  == MaxSeq \in Nat /\ MaxSeq >= 1
-ASSUME CrashesOK == MaxCrashes \in Nat
+(* Small fixed topology for the check (two workers; two root shards; one    *)
+(* child of r1, exercising reshard/parent-before-child). Encoded as strings *)
+(* so the .cfg only carries numeric bounds.                                 *)
+Workers  == {"w1", "w2"}
+Roots    == {"r1", "r2"}
+Leaves   == {"c1"}
+ParentOf == { <<"c1", "r1">> }
+NONE     == "NONE"
+
+Shards == Roots \cup Leaves
+
+ASSUME CapOK == MaxCap \in Nat /\ MaxCap >= 1
+ASSUME SeqOK == MaxSeq \in Nat /\ MaxSeq >= 1
 
 VARIABLES
-    inflight,    \* set of shards currently holding a processing slot
+    owner,       \* [Shards -> Workers \cup {NONE}] current lease holder
+    inflight,    \* [Workers -> SUBSET Shards] shards each worker is processing
+    cap,         \* [Workers -> 1..MaxCap] current per-worker concurrency cap
     checkpoint,  \* [Shards -> 0..MaxSeq] durable per-shard progress
-    delivered,   \* [Shards -> Nat] total deliveries (may exceed checkpoint => dupes)
-    crashes      \* number of crashes so far (bounded by MaxCrashes)
+    delivered,   \* [Shards -> Nat] total deliveries (>= checkpoint => dupes ok)
+    crashes,     \* crash counter (bounded)
+    handoffs     \* voluntary-handoff counter (bounded)
 
-vars == <<inflight, checkpoint, delivered, crashes>>
+vars == <<owner, inflight, cap, checkpoint, delivered, crashes, handoffs>>
 
 TypeOK ==
-    /\ inflight \subseteq Shards
+    /\ owner      \in [Shards -> Workers \cup {NONE}]
+    /\ inflight   \in [Workers -> SUBSET Shards]
+    /\ cap        \in [Workers -> 1..MaxCap]
     /\ checkpoint \in [Shards -> 0..MaxSeq]
     /\ delivered  \in [Shards -> 0..(MaxSeq + MaxCrashes)]
     /\ crashes    \in 0..MaxCrashes
+    /\ handoffs   \in 0..MaxHandoffs
+
+(* A child may be worked only once its parent is fully checkpointed. Roots  *)
+(* (no matching pair) are always parent-complete.                           *)
+ParentComplete(s) == \A pr \in ParentOf : (pr[1] = s) => checkpoint[pr[2]] = MaxSeq
+Eligible(s) == checkpoint[s] < MaxSeq /\ ParentComplete(s)
 
 Init ==
-    /\ inflight   = {}
+    /\ owner      = [s \in Shards |-> NONE]
+    /\ inflight   = [w \in Workers |-> {}]
+    /\ cap        = [w \in Workers |-> 1]
     /\ checkpoint = [s \in Shards |-> 0]
     /\ delivered  = [s \in Shards |-> 0]
     /\ crashes    = 0
+    /\ handoffs   = 0
 
-(* Acquire a processing slot for shard s: not already processing, work left, *)
-(* and a permit is free. `Cardinality(inflight) < Cap` is where the cap binds.*)
-Acquire(s) ==
-    /\ s \notin inflight
+(* Take the lease on an unowned, eligible shard. *)
+AcquireLease(w, s) ==
+    /\ owner[s] = NONE
+    /\ Eligible(s)
+    /\ owner' = [owner EXCEPT ![s] = w]
+    /\ UNCHANGED <<inflight, cap, checkpoint, delivered, crashes, handoffs>>
+
+(* Acquire a processing slot for an owned shard: this is where the cap      *)
+(* binds (Cardinality(inflight[w]) < cap[w]).                                *)
+StartProcess(w, s) ==
+    /\ owner[s] = w
+    /\ s \notin inflight[w]
     /\ checkpoint[s] < MaxSeq
-    /\ Cardinality(inflight) < Cap
-    /\ inflight' = inflight \cup {s}
-    /\ UNCHANGED <<checkpoint, delivered, crashes>>
+    /\ Cardinality(inflight[w]) < cap[w]
+    /\ inflight' = [inflight EXCEPT ![w] = @ \cup {s}]
+    /\ UNCHANGED <<owner, cap, checkpoint, delivered, crashes, handoffs>>
 
-(* Complete the in-flight record: deliver it and advance the durable          *)
-(* checkpoint by exactly one, releasing the slot.                             *)
-Complete(s) ==
-    /\ s \in inflight
+(* Deliver the in-flight record, advance the durable checkpoint by one,     *)
+(* release the slot.                                                        *)
+Complete(w, s) ==
+    /\ s \in inflight[w]
     /\ delivered'  = [delivered  EXCEPT ![s] = @ + 1]
     /\ checkpoint' = [checkpoint EXCEPT ![s] = @ + 1]
-    /\ inflight'   = inflight \ {s}
-    /\ UNCHANGED crashes
+    /\ inflight'   = [inflight EXCEPT ![w] = @ \ {s}]
+    /\ UNCHANGED <<owner, cap, crashes, handoffs>>
 
-(* Crash while processing s: the record may have been delivered (at-least-once)*)
-(* but the checkpoint is NOT advanced; the slot frees and the same seq is      *)
-(* reprocessed later (possible duplicate, never loss).                         *)
-Crash(s) ==
-    /\ s \in inflight
+(* Crash while processing: record may have been delivered (at-least-once),  *)
+(* checkpoint NOT advanced, slot freed and lease dropped -> reprocessed.    *)
+Crash(w, s) ==
+    /\ s \in inflight[w]
     /\ crashes < MaxCrashes
     /\ delivered' = [delivered EXCEPT ![s] = @ + 1]
-    /\ inflight'  = inflight \ {s}
+    /\ inflight'  = [inflight EXCEPT ![w] = @ \ {s}]
+    /\ owner'     = [owner EXCEPT ![s] = NONE]
     /\ crashes'   = crashes + 1
-    /\ UNCHANGED checkpoint
+    /\ UNCHANGED <<cap, checkpoint, handoffs>>
+
+(* Give up a lease at a batch boundary (steal/expiry): only when not        *)
+(* mid-process, so another worker can pick the shard up. Bounded.           *)
+LoseLease(w, s) ==
+    /\ owner[s] = w
+    /\ s \notin inflight[w]
+    /\ handoffs < MaxHandoffs
+    /\ owner' = [owner EXCEPT ![s] = NONE]
+    /\ handoffs' = handoffs + 1
+    /\ UNCHANGED <<inflight, cap, checkpoint, delivered, crashes>>
+
+(* Online resize of a worker's cap. Grow freely; shrink only to >= the      *)
+(* current in-flight count (the "shrink waits for a slot to free" rule),    *)
+(* so PerWorkerBound is preserved across the resize. k /= current => a real *)
+(* transition.                                                              *)
+Resize(w) ==
+    /\ \E k \in 1..MaxCap :
+        /\ k # cap[w]
+        /\ k >= Cardinality(inflight[w])
+        /\ cap' = [cap EXCEPT ![w] = k]
+    /\ UNCHANGED <<owner, inflight, checkpoint, delivered, crashes, handoffs>>
 
 Next ==
-    \/ \E s \in Shards : Acquire(s)
-    \/ \E s \in Shards : Complete(s)
-    \/ \E s \in Shards : Crash(s)
+    \/ \E w \in Workers, s \in Shards :
+          \/ AcquireLease(w, s)
+          \/ StartProcess(w, s)
+          \/ Complete(w, s)
+          \/ Crash(w, s)
+          \/ LoseLease(w, s)
+    \/ \E w \in Workers : Resize(w)
 
-(* Strong fairness on acquire + complete models the FIFO (fair) tokio         *)
-(* Semaphore: a shard that can repeatedly obtain a slot eventually does, so    *)
-(* no shard starves even when the cap is saturated by others.                  *)
+(* Fairness: some worker eventually leases each eligible shard, and the     *)
+(* owner eventually starts + completes it. Crashes and handoffs are bounded *)
+(* (finite disruption), so the system drains. Resize is left unfair (it     *)
+(* must not be required for progress).                                      *)
+AcquireSome(s) == \E w \in Workers : AcquireLease(w, s)
 Fairness ==
-    /\ \A s \in Shards : SF_vars(Acquire(s))
-    /\ \A s \in Shards : SF_vars(Complete(s))
+    /\ \A s \in Shards : SF_vars(AcquireSome(s))
+    /\ \A w \in Workers, s \in Shards : SF_vars(StartProcess(w, s))
+    /\ \A w \in Workers, s \in Shards : SF_vars(Complete(w, s))
 
 Spec == Init /\ [][Next]_vars /\ Fairness
 
 -----------------------------------------------------------------------------
 (* Safety *)
-BoundOK      == Cardinality(inflight) <= Cap
+PerWorkerBound  == \A w \in Workers : Cardinality(inflight[w]) <= cap[w]
+MutualExclusion == \A w1, w2 \in Workers :
+                       (w1 # w2) => (inflight[w1] \cap inflight[w2] = {})
+OwnedWhileProc  == \A w \in Workers : \A s \in inflight[w] : owner[s] = w
+ParentBeforeChild ==
+    \A pr \in ParentOf :
+        LET c == pr[1] p == pr[2] IN
+        (checkpoint[c] > 0 \/ (\E w \in Workers : c \in inflight[w]))
+            => checkpoint[p] = MaxSeq
 CheckpointOK == \A s \in Shards : checkpoint[s] \in 0..MaxSeq
 AtLeastOnce  == \A s \in Shards : delivered[s] >= checkpoint[s]
 
