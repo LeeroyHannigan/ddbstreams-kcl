@@ -566,9 +566,6 @@ where
                         poll_interval_ms: self.config.poll_interval_ms,
                         metrics: self.metrics.clone(),
                         ckpt_defer: self.ckpt_defer.clone(),
-                        renew_after: Duration::from_millis(
-                            (self.config.lease_duration_ms / 3).max(1),
-                        ),
                     };
                     set.spawn(async move {
                         let _ = process_shard(src, lease, consumer, task).await;
@@ -718,7 +715,6 @@ where
             let metrics = self.metrics.clone();
             let poll_interval_ms = self.config.poll_interval_ms;
             let ckpt_defer = self.ckpt_defer.clone();
-            let renew_after = Duration::from_millis((self.config.lease_duration_ms / 3).max(1));
             set.spawn(async move {
                 loop {
                     let item = {
@@ -748,7 +744,6 @@ where
                         poll_interval_ms,
                         metrics: metrics.clone(),
                         ckpt_defer: ckpt_defer.clone(),
-                        renew_after,
                     };
                     let outcome = process_shard(src.clone(), lease.clone(), consumer, task)
                         .await
@@ -1012,10 +1007,6 @@ struct ShardTask {
     metrics: SharedMetricsSink,
     /// Deferred-checkpoint policy (`None` ⇒ persist per delivered batch).
     ckpt_defer: Option<Arc<CkptDefer>>,
-    /// How long a pass may go without touching the lease before an explicit
-    /// renew (lease_duration / 3). Only exercised on the deferred path — the
-    /// per-batch checkpoint doubles as the heartbeat otherwise.
-    renew_after: Duration,
 }
 
 /// Drive a single shard: deliver records in order, checkpoint/heartbeat under the
@@ -1040,7 +1031,6 @@ where
         poll_interval_ms,
         metrics,
         ckpt_defer,
-        renew_after,
     } = task;
     // Resume position. With deferred checkpoints, the in-memory pending ack
     // (when present) is AHEAD of the lease's durable checkpoint and is the
@@ -1052,9 +1042,6 @@ where
         .and_then(|d| d.resume_from(&shard))
         .or(checkpoint);
     let mut delivered_any = false;
-    // Last time this pass touched the lease (counter came fresh from the
-    // cycle's lease scan). Only consulted on the deferred path.
-    let mut last_lease_touch = Instant::now();
     loop {
         let batch = source.get_records(&shard, after.clone()).await?;
         if !batch.records.is_empty() {
@@ -1072,7 +1059,6 @@ where
                             match leases.checkpoint(&shard, &owner, counter, &ack).await {
                                 Ok(c) => {
                                     counter = c;
-                                    last_lease_touch = Instant::now();
                                 }
                                 Err(_) => {
                                     metrics.on_lease_lost(&shard);
@@ -1088,7 +1074,6 @@ where
                                 match leases.checkpoint(&shard, &owner, counter, &due).await {
                                     Ok(c) => {
                                         counter = c;
-                                        last_lease_touch = now;
                                         defer.persisted(&shard, now);
                                     }
                                     Err(_) => {
@@ -1098,42 +1083,16 @@ where
                                         return Ok(PassOutcome::Stopped);
                                     }
                                 }
-                            } else if now.duration_since(last_lease_touch) >= renew_after {
-                                // No persist due, but a long hot pass must
-                                // still heartbeat the lease.
-                                match leases.renew(&shard, &owner, counter).await {
-                                    Ok(c) => {
-                                        counter = c;
-                                        last_lease_touch = now;
-                                    }
-                                    Err(_) => {
-                                        defer.forget(&shard);
-                                        metrics.on_lease_lost(&shard);
-                                        let _ = consumer.lease_lost().await;
-                                        return Ok(PassOutcome::Stopped);
-                                    }
-                                }
                             }
+                            // No per-shard renew on a long hot pass — the worker
+                            // heartbeat holds the lease between interval flushes.
                         }
                     }
                 }
                 Ok(None) => {
-                    // Delivered but not acked: hold the lease without advancing
-                    // the durable checkpoint (heartbeat).
-                    match leases.renew(&shard, &owner, counter).await {
-                        Ok(c) => {
-                            counter = c;
-                            last_lease_touch = Instant::now();
-                        }
-                        Err(_) => {
-                            if let Some(d) = ckpt_defer.as_ref() {
-                                d.forget(&shard);
-                            }
-                            metrics.on_lease_lost(&shard);
-                            let _ = consumer.lease_lost().await;
-                            return Ok(PassOutcome::Stopped);
-                        }
-                    }
+                    // Delivered but not acked: do not advance the durable
+                    // checkpoint and do not write a per-shard renew — the
+                    // worker heartbeat holds the lease.
                 }
                 Err(_) => {
                     if let Some(d) = ckpt_defer.as_ref() {
@@ -1175,9 +1134,9 @@ where
             return Ok(PassOutcome::Ended);
         }
         if batch.records.is_empty() {
-            // Idle: heartbeat to keep the lease (best-effort; drain model then
-            // returns — a continuous consumer would keep looping with backoff).
-            let _ = leases.renew(&shard, &owner, counter).await;
+            // Idle: no per-shard write — the worker's heartbeat holds this
+            // (and every) lease. (drain model returns; a continuous consumer
+            // would loop with backoff.)
             let _ = poll_interval_ms;
             return Ok(if delivered_any {
                 PassOutcome::Active
