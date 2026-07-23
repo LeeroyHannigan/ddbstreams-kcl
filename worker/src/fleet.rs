@@ -15,6 +15,7 @@ use crate::{
     WorkerError,
 };
 use amazon_dynamodb_streams_consumer_core::cleanup::{leases_safe_to_delete, LeaseState};
+use amazon_dynamodb_streams_consumer_core::coordinator::is_heartbeat_key;
 use amazon_dynamodb_streams_consumer_core::coordinator::{LeaseCoordinator, RawLease};
 use amazon_dynamodb_streams_consumer_core::leader::{shard_metas_from_leases, LEADER_LEASE_KEY};
 use amazon_dynamodb_streams_consumer_core::metrics::{noop_sink, ShardMetrics, SharedMetricsSink};
@@ -459,6 +460,13 @@ where
             self.cleanup_completed_leases(&rows).await;
         }
 
+        // Emit this worker's single liveness heartbeat for the cycle. This is
+        // the per-worker signal the coordinator uses to judge ownership
+        // liveness (see core::coordinator), replacing per-shard renews.
+        // Best-effort: a missed heartbeat just risks the worker being seen as
+        // expired after lease_duration — identical to a missed renew before.
+        let _ = self.leases.heartbeat(&self.config.owner).await;
+
         // 1) Decide + claim this worker's share (sentinel lease excluded from
         //    shard coordination).
         let shard_rows: Vec<RawLease> = self
@@ -475,13 +483,15 @@ where
         }
 
         // 2) Re-read ownership + completion; rebuild the shard graph from leases
-        //    (NOT DescribeStream — the leader already published it).
+        //    (NOT DescribeStream — the leader already published it). Heartbeat
+        //    rows (`__hb__:*`) are excluded here — they are liveness signals,
+        //    not shards.
         let shard_rows: Vec<RawLease> = self
             .leases
             .list()
             .await?
             .into_iter()
-            .filter(|r| r.lease_key != LEADER_LEASE_KEY)
+            .filter(|r| r.lease_key != LEADER_LEASE_KEY && !is_heartbeat_key(&r.lease_key))
             .collect();
         let owner = self.config.owner.as_str();
         // shard -> (lease counter, resume checkpoint). The checkpoint lets a

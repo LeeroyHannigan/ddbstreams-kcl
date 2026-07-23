@@ -9,7 +9,8 @@ use crate::Lease;
 use aws_sdk_dynamodb::error::ProvideErrorMetadata;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType,
-    PointInTimeRecoverySpecification, ProvisionedThroughput, ScalarAttributeType, TableStatus,
+    PointInTimeRecoverySpecification, ProvisionedThroughput, ReturnValue, ScalarAttributeType,
+    TableStatus,
 };
 use aws_sdk_dynamodb::Client;
 use std::collections::HashMap;
@@ -356,6 +357,39 @@ impl DynamoDbLeaseStore {
                 .await;
             match r {
                 Ok(_) => Ok(counter + 1),
+                Err(e) => Err(classify(e)),
+            }
+        })
+        .await
+    }
+
+    /// Bump this worker's heartbeat row (`__hb__:<worker>` — matches
+    /// `core::coordinator::HEARTBEAT_KEY_PREFIX`), creating it at counter 1 if
+    /// absent. Unconditional: a worker owns its own heartbeat key, so there is
+    /// no optimistic-lock contention. This is the single per-worker liveness
+    /// write that replaces per-shard renews. Returns the new counter.
+    pub async fn heartbeat(&self, worker: &str) -> Result<u64, LeaseError> {
+        let key = format!("__hb__:{worker}");
+        with_throttle_retry(|| async {
+            let r = self
+                .client
+                .update_item()
+                .table_name(&self.table)
+                .key(LEASE_KEY, AttributeValue::S(key.clone()))
+                // ADD creates leaseCounter at :one if the row/attr is absent.
+                .update_expression("SET leaseOwner = :w ADD leaseCounter :one")
+                .expression_attribute_values(":w", AttributeValue::S(worker.to_string()))
+                .expression_attribute_values(":one", AttributeValue::N("1".into()))
+                .return_values(ReturnValue::UpdatedNew)
+                .send()
+                .await;
+            match r {
+                Ok(o) => Ok(o
+                    .attributes()
+                    .and_then(|a| a.get(LEASE_COUNTER))
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or(0)),
                 Err(e) => Err(classify(e)),
             }
         })

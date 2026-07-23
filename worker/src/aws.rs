@@ -60,6 +60,11 @@ impl AsyncLeaseStore for DynamoDbLeaseStore {
             .await
             .map_err(box_lease)
     }
+    async fn heartbeat(&self, worker: &str) -> Result<u64, WorkerError> {
+        DynamoDbLeaseStore::heartbeat(self, worker)
+            .await
+            .map_err(box_lease)
+    }
     async fn acquire(&self, key: &str, owner: &str) -> Result<LeaseHandle, WorkerError> {
         let l = DynamoDbLeaseStore::acquire(self, key, owner)
             .await

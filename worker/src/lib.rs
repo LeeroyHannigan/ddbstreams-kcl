@@ -75,6 +75,16 @@ pub trait AsyncLeaseStore {
     async fn acquire(&self, lease_key: &str, owner: &str) -> Result<LeaseHandle, WorkerError>;
     /// Heartbeat: bump the counter conditional on ownership. Returns new counter.
     async fn renew(&self, lease_key: &str, owner: &str, counter: u64) -> Result<u64, WorkerError>;
+
+    /// Bump this worker's heartbeat row (`__hb__:<worker>`), creating it if
+    /// absent. This is the single per-worker liveness signal — the coordinator
+    /// judges an owner alive from its heartbeat row, not per-shard counters
+    /// (see [`amazon_dynamodb_streams_consumer_core::coordinator`]). Returns the
+    /// new heartbeat counter. Default no-op (`Ok(0)`) for in-memory/test stores
+    /// that don't model cross-worker liveness.
+    async fn heartbeat(&self, _worker: &str) -> Result<u64, WorkerError> {
+        Ok(0)
+    }
     async fn checkpoint(
         &self,
         lease_key: &str,
