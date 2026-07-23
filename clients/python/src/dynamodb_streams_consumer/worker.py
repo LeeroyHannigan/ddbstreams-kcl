@@ -90,6 +90,7 @@ class Worker:
         poll_interval_ms: Optional[int] = None,
         cycle_interval_ms: Optional[int] = None,
         max_processing_concurrency: Optional[int] = None,
+        checkpoint_interval_ms: Optional[int] = None,
         initial_position: Optional[InitialPosition] = None,
         sidecar_path: Optional[str] = None,
         sidecar_cmd: Optional[Sequence[str]] = None,
@@ -109,6 +110,7 @@ class Worker:
         self.poll_interval_ms = poll_interval_ms
         self.cycle_interval_ms = cycle_interval_ms
         self.max_processing_concurrency = max_processing_concurrency
+        self.checkpoint_interval_ms = checkpoint_interval_ms
         self.initial_position = initial_position
         # sidecar_cmd overrides everything (tests / custom launch); otherwise the
         # resolved single binary.
@@ -130,6 +132,7 @@ class Worker:
             ("DDB_STREAMS_CONSUMER_POLL_INTERVAL_MS", self.poll_interval_ms),
             ("DDB_STREAMS_CONSUMER_CYCLE_INTERVAL_MS", self.cycle_interval_ms),
             ("DDB_STREAMS_CONSUMER_MAX_PROCESSING_CONCURRENCY", self.max_processing_concurrency),
+            ("DDB_STREAMS_CONSUMER_CHECKPOINT_INTERVAL_MS", self.checkpoint_interval_ms),
         ]:
             if val is not None:
                 env[key] = str(val)

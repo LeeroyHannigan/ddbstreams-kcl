@@ -94,6 +94,13 @@ outside the pool so waiting shards keep their leases. At-least-once, per-item,
 and per-shard ordering are preserved. Trade-off: a small pool over many active
 shards raises cold-shard poll latency (iterator age).
 
+`checkpoint_interval_ms` — optional keyword arg on `Worker(...)`. Caps durable
+checkpoint writes to at most one per interval per shard instead of one per
+batch. Unset = per-batch (prior behavior). On a crash, up to one interval of
+already-acked records may be redelivered, so handlers must be idempotent (the
+same at-least-once contract, a wider window). Flushed at shard end and on
+graceful shutdown.
+
 `initial_position` — optional keyword arg on `Worker(...)` controlling where a
 freshly-seeded shard begins reading. Values are `TRIM_HORIZON` (the default —
 start at the oldest available record) and `LATEST` (start at the newest). Input

@@ -65,18 +65,22 @@ VARIABLES
     inflight,    \* [Workers -> SUBSET Shards] shards each worker is processing
     cap,         \* [Workers -> 1..MaxCap] current per-worker concurrency cap
     checkpoint,  \* [Shards -> 0..MaxSeq] durable per-shard progress
-    delivered,   \* [Shards -> Nat] total deliveries (>= checkpoint => dupes ok)
+    acked,       \* [Shards -> 0..MaxSeq] in-memory high-water mark (deferred
+                 \* checkpointing: acked >= checkpoint while owned; the gap is
+                 \* the pending window, LOST on crash/lease loss)
+    delivered,   \* [Shards -> Nat] total deliveries (>= acked => dupes ok)
     crashes,     \* crash counter (bounded)
     handoffs     \* voluntary-handoff counter (bounded)
 
-vars == <<owner, inflight, cap, checkpoint, delivered, crashes, handoffs>>
+vars == <<owner, inflight, cap, checkpoint, acked, delivered, crashes, handoffs>>
 
 TypeOK ==
     /\ owner      \in [Shards -> Workers \cup {NONE}]
     /\ inflight   \in [Workers -> SUBSET Shards]
     /\ cap        \in [Workers -> 1..MaxCap]
     /\ checkpoint \in [Shards -> 0..MaxSeq]
-    /\ delivered  \in [Shards -> 0..(MaxSeq + MaxCrashes)]
+    /\ acked      \in [Shards -> 0..MaxSeq]
+    /\ delivered  \in [Shards -> 0..(MaxSeq * (1 + MaxCrashes + MaxHandoffs))]
     /\ crashes    \in 0..MaxCrashes
     /\ handoffs   \in 0..MaxHandoffs
 
@@ -90,6 +94,7 @@ Init ==
     /\ inflight   = [w \in Workers |-> {}]
     /\ cap        = [w \in Workers |-> 1]
     /\ checkpoint = [s \in Shards |-> 0]
+    /\ acked      = [s \in Shards |-> 0]
     /\ delivered  = [s \in Shards |-> 0]
     /\ crashes    = 0
     /\ handoffs   = 0
@@ -99,6 +104,7 @@ AcquireLease(w, s) ==
     /\ owner[s] = NONE
     /\ Eligible(s)
     /\ owner' = [owner EXCEPT ![s] = w]
+    /\ acked' = [acked EXCEPT ![s] = checkpoint[s]]  \* resume from durable
     /\ UNCHANGED <<inflight, cap, checkpoint, delivered, crashes, handoffs>>
 
 (* Acquire a processing slot for an owned shard: this is where the cap      *)
@@ -106,19 +112,37 @@ AcquireLease(w, s) ==
 StartProcess(w, s) ==
     /\ owner[s] = w
     /\ s \notin inflight[w]
-    /\ checkpoint[s] < MaxSeq
+    /\ acked[s] < MaxSeq  \* resume-from-pending: progress is the acked mark
     /\ Cardinality(inflight[w]) < cap[w]
     /\ inflight' = [inflight EXCEPT ![w] = @ \cup {s}]
-    /\ UNCHANGED <<owner, cap, checkpoint, delivered, crashes, handoffs>>
+    /\ UNCHANGED <<owner, cap, checkpoint, acked, delivered, crashes, handoffs>>
 
 (* Deliver the in-flight record, advance the durable checkpoint by one,     *)
 (* release the slot.                                                        *)
 Complete(w, s) ==
     /\ s \in inflight[w]
-    /\ delivered'  = [delivered  EXCEPT ![s] = @ + 1]
-    /\ checkpoint' = [checkpoint EXCEPT ![s] = @ + 1]
-    /\ inflight'   = [inflight EXCEPT ![w] = @ \ {s}]
+    /\ acked[s] < MaxSeq
+    /\ delivered' = [delivered EXCEPT ![s] = @ + 1]
+    /\ acked'     = [acked EXCEPT ![s] = @ + 1]
+    /\ IF acked[s] + 1 = MaxSeq
+       THEN \* mandatory shard-end flush: the final durable checkpoint
+            \* reflects everything acked before the shard completes.
+            checkpoint' = [checkpoint EXCEPT ![s] = MaxSeq]
+       ELSE \* interval persist fired (checkpoint catches up to acked) or
+            \* deferred (durable state unchanged) - nondeterministic, which
+            \* covers every interval phase.
+            \/ checkpoint' = [checkpoint EXCEPT ![s] = acked[s] + 1]
+            \/ UNCHANGED checkpoint
+    /\ inflight' = [inflight EXCEPT ![w] = @ \ {s}]
     /\ UNCHANGED <<owner, cap, crashes, handoffs>>
+
+(* Persist the pending high-water mark outside a delivery (interval firing   *)
+(* between batches, or the graceful-release flush).                          *)
+Flush(w, s) ==
+    /\ owner[s] = w
+    /\ acked[s] > checkpoint[s]
+    /\ checkpoint' = [checkpoint EXCEPT ![s] = acked[s]]
+    /\ UNCHANGED <<owner, inflight, cap, acked, delivered, crashes, handoffs>>
 
 (* Crash while processing: record may have been delivered (at-least-once),  *)
 (* checkpoint NOT advanced, slot freed and lease dropped -> reprocessed.    *)
@@ -126,6 +150,7 @@ Crash(w, s) ==
     /\ s \in inflight[w]
     /\ crashes < MaxCrashes
     /\ delivered' = [delivered EXCEPT ![s] = @ + 1]
+    /\ acked'     = [acked EXCEPT ![s] = checkpoint[s]]  \* pending window lost
     /\ inflight'  = [inflight EXCEPT ![w] = @ \ {s}]
     /\ owner'     = [owner EXCEPT ![s] = NONE]
     /\ crashes'   = crashes + 1
@@ -138,6 +163,7 @@ LoseLease(w, s) ==
     /\ s \notin inflight[w]
     /\ handoffs < MaxHandoffs
     /\ owner' = [owner EXCEPT ![s] = NONE]
+    /\ acked' = [acked EXCEPT ![s] = checkpoint[s]]  \* worst case: no flush
     /\ handoffs' = handoffs + 1
     /\ UNCHANGED <<inflight, cap, checkpoint, delivered, crashes>>
 
@@ -150,13 +176,14 @@ Resize(w) ==
         /\ k # cap[w]
         /\ k >= Cardinality(inflight[w])
         /\ cap' = [cap EXCEPT ![w] = k]
-    /\ UNCHANGED <<owner, inflight, checkpoint, delivered, crashes, handoffs>>
+    /\ UNCHANGED <<owner, inflight, checkpoint, acked, delivered, crashes, handoffs>>
 
 Next ==
     \/ \E w \in Workers, s \in Shards :
           \/ AcquireLease(w, s)
           \/ StartProcess(w, s)
           \/ Complete(w, s)
+          \/ Flush(w, s)
           \/ Crash(w, s)
           \/ LoseLease(w, s)
     \/ \E w \in Workers : Resize(w)
@@ -185,7 +212,10 @@ ParentBeforeChild ==
         (checkpoint[c] > 0 \/ (\E w \in Workers : c \in inflight[w]))
             => checkpoint[p] = MaxSeq
 CheckpointOK == \A s \in Shards : checkpoint[s] \in 0..MaxSeq
-AtLeastOnce  == \A s \in Shards : delivered[s] >= checkpoint[s]
+(* The durable checkpoint never runs ahead of what was acked - deferral only *)
+(* ever delays persistence, it cannot invent progress.                       *)
+DeferralOK   == \A s \in Shards : checkpoint[s] <= acked[s]
+AtLeastOnce  == \A s \in Shards : delivered[s] >= acked[s]
 
 (* Liveness *)
 Done        == \A s \in Shards : checkpoint[s] = MaxSeq

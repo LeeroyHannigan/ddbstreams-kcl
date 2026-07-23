@@ -150,6 +150,14 @@ pub struct Fleet<S, L> {
     /// keep-alive for queued shards runs outside the pool, so waiting shards
     /// are never reaped. Set via [`Fleet::with_max_processing_concurrency`].
     processing_limit: Option<Arc<ProcessingLimit>>,
+    /// Optional deferred-checkpoint policy (`with_checkpoint_interval`).
+    /// `None` ⇒ persist the checkpoint per delivered batch (the default,
+    /// behavior-identical to prior releases). `Some` ⇒ acks accumulate as an
+    /// in-memory high-water mark per shard and the durable checkpoint is
+    /// written at most once per interval per shard (plus a mandatory flush at
+    /// shard end and on graceful release). Widens the crash-redelivery window
+    /// to the interval; never loses records (at-least-once preserved).
+    ckpt_defer: Option<Arc<CkptDefer>>,
     /// Per-shard poll schedule for the bounded path (idle backoff), persisted
     /// across coordination cycles. Unused (empty) when unbounded.
     sched: Arc<std::sync::Mutex<HashMap<ShardId, ShardSched>>>,
@@ -163,6 +171,78 @@ pub struct Fleet<S, L> {
 /// effect at the next coordination cycle).
 struct ProcessingLimit {
     max: std::sync::atomic::AtomicUsize,
+}
+
+/// Deferred-checkpoint policy: acked progress is held in memory and persisted
+/// to the lease table at most once per `interval` per shard (strict interval).
+///
+/// The pending high-water mark is the RESUME source while it exists — a pass
+/// resumes reading after the pending ack, not the (older) durable checkpoint,
+/// so deferral does not cause steady-state redelivery. On crash the pending
+/// map is lost and the shard resumes from the last durable checkpoint: up to
+/// `interval` of acked records are redelivered (at-least-once, never loss).
+struct CkptDefer {
+    interval: Duration,
+    /// shard -> pending state. Entries are pruned to owned shards each cycle
+    /// and removed at shard end / lease loss.
+    state: std::sync::Mutex<HashMap<ShardId, PendingCkpt>>,
+}
+
+/// Per-shard deferred-checkpoint state.
+struct PendingCkpt {
+    /// Highest acked sequence number not yet durably checkpointed.
+    ack: Option<String>,
+    /// When the durable checkpoint for this shard was last written.
+    last_persist: Instant,
+}
+
+impl CkptDefer {
+    /// Record an ack; returns the ack to PERSIST now if the interval has
+    /// elapsed (caller writes the checkpoint and must call `persisted`).
+    fn record_ack(&self, shard: &str, ack: &str, now: Instant) -> Option<String> {
+        let mut st = self.state.lock().expect("ckpt mutex poisoned");
+        let e = st.entry(shard.to_string()).or_insert(PendingCkpt {
+            ack: None,
+            last_persist: now,
+        });
+        e.ack = Some(ack.to_string());
+        if now.duration_since(e.last_persist) >= self.interval {
+            e.ack.clone()
+        } else {
+            None
+        }
+    }
+
+    /// Mark the shard's pending ack as durably persisted.
+    fn persisted(&self, shard: &str, now: Instant) {
+        let mut st = self.state.lock().expect("ckpt mutex poisoned");
+        if let Some(e) = st.get_mut(shard) {
+            e.ack = None;
+            e.last_persist = now;
+        }
+    }
+
+    /// Take (and clear) the pending ack for a mandatory flush (shard end,
+    /// graceful release).
+    fn take_pending(&self, shard: &str) -> Option<String> {
+        let mut st = self.state.lock().expect("ckpt mutex poisoned");
+        st.get_mut(shard).and_then(|e| e.ack.take())
+    }
+
+    /// The resume position override: a pass must resume after the pending ack
+    /// when one exists (it is at or ahead of the durable checkpoint).
+    fn resume_from(&self, shard: &str) -> Option<String> {
+        let st = self.state.lock().expect("ckpt mutex poisoned");
+        st.get(shard).and_then(|e| e.ack.clone())
+    }
+
+    /// Drop a shard's state (shard ended or lease lost).
+    fn forget(&self, shard: &str) {
+        self.state
+            .lock()
+            .expect("ckpt mutex poisoned")
+            .remove(shard);
+    }
 }
 
 /// Per-shard scheduling state for the bounded (pool) path, persisted across
@@ -249,6 +329,7 @@ where
             metrics: noop_sink(),
             processing_limit: None,
             sched: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            ckpt_defer: None,
         }
     }
 
@@ -302,6 +383,31 @@ where
             return; // unbounded fleet: nothing to resize
         };
         pl.max.store(target.max(1), Ordering::SeqCst);
+    }
+
+    /// Defer durable checkpoints to at most one write per `interval_ms` per
+    /// shard (opt-in). `None`/`Some(0)` (the default) keeps prior behavior:
+    /// the checkpoint is persisted after every delivered batch.
+    ///
+    /// When set, acks accumulate as an in-memory high-water mark and the
+    /// lease-table write happens on the interval, at shard end, and on
+    /// graceful release — cutting checkpoint write volume from
+    /// O(batches/sec) to O(active shards / interval) and removing the write
+    /// from the hot delivery path. Passes resume from the in-memory mark, so
+    /// deferral causes no steady-state redelivery. The trade-off, stated
+    /// plainly: **on crash or lease loss, up to `interval_ms` of already-
+    /// acked records are redelivered** (the consumer must be idempotent —
+    /// the same at-least-once contract as today, with a wider window).
+    /// Delivery, per-item order, and per-shard order are unchanged.
+    pub fn with_checkpoint_interval(mut self, interval_ms: Option<u64>) -> Self {
+        self.ckpt_defer = match interval_ms {
+            Some(ms) if ms >= 1 => Some(Arc::new(CkptDefer {
+                interval: Duration::from_millis(ms),
+                state: std::sync::Mutex::new(HashMap::new()),
+            })),
+            _ => None,
+        };
+        self
     }
 
     /// Run coordination cycles until every shard's lease is complete or
@@ -389,6 +495,16 @@ where
             .map(|r| (r.lease_key.clone(), (r.lease_counter, r.checkpoint.clone())))
             .collect();
         self.metrics.on_leases_held(owned.len() as u64);
+        // Prune deferred-checkpoint state to shards we still own — an entry
+        // for a shard whose lease moved must not survive (the new owner's
+        // durable view is authoritative; our pending ack is stale context).
+        if let Some(defer) = self.ckpt_defer.as_ref() {
+            defer
+                .state
+                .lock()
+                .expect("ckpt mutex poisoned")
+                .retain(|s, _| owned.contains_key(s));
+        }
         if let Some(pl) = self.processing_limit.as_ref() {
             self.metrics.on_max_processing_concurrency(
                 pl.max.load(std::sync::atomic::Ordering::SeqCst) as u64,
@@ -439,6 +555,10 @@ where
                         checkpoint,
                         poll_interval_ms: self.config.poll_interval_ms,
                         metrics: self.metrics.clone(),
+                        ckpt_defer: self.ckpt_defer.clone(),
+                        renew_after: Duration::from_millis(
+                            (self.config.lease_duration_ms / 3).max(1),
+                        ),
                     };
                     set.spawn(async move {
                         let _ = process_shard(src, lease, consumer, task).await;
@@ -587,6 +707,8 @@ where
             let owner = self.config.owner.clone();
             let metrics = self.metrics.clone();
             let poll_interval_ms = self.config.poll_interval_ms;
+            let ckpt_defer = self.ckpt_defer.clone();
+            let renew_after = Duration::from_millis((self.config.lease_duration_ms / 3).max(1));
             set.spawn(async move {
                 loop {
                     let item = {
@@ -615,6 +737,8 @@ where
                         checkpoint: item.checkpoint,
                         poll_interval_ms,
                         metrics: metrics.clone(),
+                        ckpt_defer: ckpt_defer.clone(),
+                        renew_after,
                     };
                     let outcome = process_shard(src.clone(), lease.clone(), consumer, task)
                         .await
@@ -834,15 +958,32 @@ where
         let owner = self.config.owner.as_str();
         let mut released = 0;
         for r in rows {
-            if r.owner.as_deref() == Some(owner)
-                && !r.completed
-                && self
+            if r.owner.as_deref() == Some(owner) && !r.completed {
+                // Graceful release: flush any deferred checkpoint FIRST so the
+                // next owner resumes from everything we acked (no redelivery
+                // window on a clean handoff). Best-effort: a failed flush
+                // falls back to the wider at-least-once window.
+                let mut counter = r.lease_counter;
+                if let Some(defer) = self.ckpt_defer.as_ref() {
+                    if let Some(pending) = defer.take_pending(&r.lease_key) {
+                        if let Ok(c) = self
+                            .leases
+                            .checkpoint(&r.lease_key, owner, counter, &pending)
+                            .await
+                        {
+                            counter = c;
+                        }
+                    }
+                    defer.forget(&r.lease_key);
+                }
+                if self
                     .leases
-                    .release(&r.lease_key, owner, r.lease_counter)
+                    .release(&r.lease_key, owner, counter)
                     .await
                     .is_ok()
-            {
-                released += 1;
+                {
+                    released += 1;
+                }
             }
         }
         Ok(released)
@@ -859,6 +1000,12 @@ struct ShardTask {
     checkpoint: Option<String>,
     poll_interval_ms: u64,
     metrics: SharedMetricsSink,
+    /// Deferred-checkpoint policy (`None` ⇒ persist per delivered batch).
+    ckpt_defer: Option<Arc<CkptDefer>>,
+    /// How long a pass may go without touching the lease before an explicit
+    /// renew (lease_duration / 3). Only exercised on the deferred path — the
+    /// per-batch checkpoint doubles as the heartbeat otherwise.
+    renew_after: Duration,
 }
 
 /// Drive a single shard: deliver records in order, checkpoint/heartbeat under the
@@ -882,13 +1029,22 @@ where
         checkpoint,
         poll_interval_ms,
         metrics,
+        ckpt_defer,
+        renew_after,
     } = task;
-    // Resume from the lease's persisted checkpoint (None = TRIM_HORIZON for a
-    // brand-new shard). This is what makes re-processing idempotent across
-    // cycles and correct across a restart. (The consumer was initialized for
-    // this shard by the factory.)
-    let mut after: Option<String> = checkpoint;
+    // Resume position. With deferred checkpoints, the in-memory pending ack
+    // (when present) is AHEAD of the lease's durable checkpoint and is the
+    // correct resume point — resuming from the durable value would redeliver
+    // every deferral window in steady state. The durable checkpoint is the
+    // fallback (fresh start, restart, or lease taken from another worker).
+    let mut after: Option<String> = ckpt_defer
+        .as_ref()
+        .and_then(|d| d.resume_from(&shard))
+        .or(checkpoint);
     let mut delivered_any = false;
+    // Last time this pass touched the lease (counter came fresh from the
+    // cycle's lease scan). Only consulted on the deferred path.
+    let mut last_lease_touch = Instant::now();
     loop {
         let batch = source.get_records(&shard, after.clone()).await?;
         if !batch.records.is_empty() {
@@ -898,27 +1054,83 @@ where
             // sidecar returns the seq the client durably processed; the sync
             // in-process adapter returns the batch's last seq.
             match consumer.deliver(&batch.records).await {
-                Ok(Some(ack)) => match leases.checkpoint(&shard, &owner, counter, &ack).await {
-                    Ok(c) => counter = c,
-                    Err(_) => {
-                        metrics.on_lease_lost(&shard);
-                        let _ = consumer.lease_lost().await; // lease lost → notify + stop
-                        return Ok(PassOutcome::Stopped);
+                Ok(Some(ack)) => {
+                    match ckpt_defer.as_ref() {
+                        None => {
+                            // Per-batch persist (default): the checkpoint
+                            // write doubles as the lease heartbeat.
+                            match leases.checkpoint(&shard, &owner, counter, &ack).await {
+                                Ok(c) => {
+                                    counter = c;
+                                    last_lease_touch = Instant::now();
+                                }
+                                Err(_) => {
+                                    metrics.on_lease_lost(&shard);
+                                    let _ = consumer.lease_lost().await;
+                                    return Ok(PassOutcome::Stopped);
+                                }
+                            }
+                        }
+                        Some(defer) => {
+                            let now = Instant::now();
+                            if let Some(due) = defer.record_ack(&shard, &ack, now) {
+                                // Interval elapsed: persist the high-water mark.
+                                match leases.checkpoint(&shard, &owner, counter, &due).await {
+                                    Ok(c) => {
+                                        counter = c;
+                                        last_lease_touch = now;
+                                        defer.persisted(&shard, now);
+                                    }
+                                    Err(_) => {
+                                        defer.forget(&shard);
+                                        metrics.on_lease_lost(&shard);
+                                        let _ = consumer.lease_lost().await;
+                                        return Ok(PassOutcome::Stopped);
+                                    }
+                                }
+                            } else if now.duration_since(last_lease_touch) >= renew_after {
+                                // No persist due, but a long hot pass must
+                                // still heartbeat the lease.
+                                match leases.renew(&shard, &owner, counter).await {
+                                    Ok(c) => {
+                                        counter = c;
+                                        last_lease_touch = now;
+                                    }
+                                    Err(_) => {
+                                        defer.forget(&shard);
+                                        metrics.on_lease_lost(&shard);
+                                        let _ = consumer.lease_lost().await;
+                                        return Ok(PassOutcome::Stopped);
+                                    }
+                                }
+                            }
+                        }
                     }
-                },
+                }
                 Ok(None) => {
                     // Delivered but not acked: hold the lease without advancing
                     // the durable checkpoint (heartbeat).
                     match leases.renew(&shard, &owner, counter).await {
-                        Ok(c) => counter = c,
+                        Ok(c) => {
+                            counter = c;
+                            last_lease_touch = Instant::now();
+                        }
                         Err(_) => {
+                            if let Some(d) = ckpt_defer.as_ref() {
+                                d.forget(&shard);
+                            }
                             metrics.on_lease_lost(&shard);
                             let _ = consumer.lease_lost().await;
                             return Ok(PassOutcome::Stopped);
                         }
                     }
                 }
-                Err(_) => return Ok(PassOutcome::Stopped), // delivery failed; lease expires
+                Err(_) => {
+                    if let Some(d) = ckpt_defer.as_ref() {
+                        d.forget(&shard);
+                    }
+                    return Ok(PassOutcome::Stopped); // delivery failed; lease expires
+                }
             }
             // Record delivered-batch metrics: throughput + per-shard lag
             // (MillisBehindLatest). Emitted after successful delivery.
@@ -931,6 +1143,22 @@ where
             after = Some(last);
         }
         if batch.shard_end {
+            // Mandatory flush BEFORE mark_complete: a completed shard's final
+            // durable checkpoint must reflect everything acked.
+            if let Some(defer) = ckpt_defer.as_ref() {
+                if let Some(pending) = defer.take_pending(&shard) {
+                    match leases.checkpoint(&shard, &owner, counter, &pending).await {
+                        Ok(c) => counter = c,
+                        Err(_) => {
+                            defer.forget(&shard);
+                            metrics.on_lease_lost(&shard);
+                            let _ = consumer.lease_lost().await;
+                            return Ok(PassOutcome::Stopped);
+                        }
+                    }
+                }
+                defer.forget(&shard);
+            }
             let _ = consumer.shard_ended().await;
             let _ = leases.mark_complete(&shard, &owner, counter).await;
             metrics.on_shard_end(&shard);
@@ -2947,5 +3175,478 @@ mod tests {
                 .all(|(_, r)| r.completed && r.checkpoint.is_some()),
             "both shards checkpointed and completed; rows: {dump:?}"
         );
+    }
+
+    // ---- deferred checkpointing (checkpoint_interval) ----
+
+    /// Lease store that counts checkpoint/renew writes (wraps FakeLeases
+    /// semantics) — the deferral claim is about WRITE VOLUME, so count writes.
+    #[derive(Default, Clone)]
+    struct CountingLeases {
+        rows: Arc<Mutex<HashMap<String, State>>>,
+        checkpoints: Arc<std::sync::atomic::AtomicUsize>,
+        renews: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl AsyncLeaseStore for CountingLeases {
+        async fn get(&self, key: &str) -> Result<Option<LeaseView>, WorkerError> {
+            Ok(self.rows.lock().unwrap().get(key).map(|r| LeaseView {
+                completed: r.completed,
+            }))
+        }
+        async fn list(&self) -> Result<Vec<RawLease>, WorkerError> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(k, r)| RawLease {
+                    lease_key: k.clone(),
+                    owner: r.owner.clone(),
+                    lease_counter: r.counter,
+                    completed: r.completed,
+                    checkpoint: r.checkpoint.clone(),
+                    parents: r.parents.clone(),
+                })
+                .collect())
+        }
+        async fn acquire(&self, key: &str, owner: &str) -> Result<LeaseHandle, WorkerError> {
+            let mut rows = self.rows.lock().unwrap();
+            let r = rows.entry(key.to_string()).or_default();
+            r.owner = Some(owner.to_string());
+            r.counter += 1;
+            Ok(LeaseHandle {
+                owner: owner.to_string(),
+                counter: r.counter,
+                checkpoint: r.checkpoint.clone(),
+            })
+        }
+        async fn renew(&self, key: &str, _o: &str, counter: u64) -> Result<u64, WorkerError> {
+            self.renews
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut rows = self.rows.lock().unwrap();
+            let r = rows.get_mut(key).ok_or("no lease")?;
+            r.counter = counter + 1;
+            Ok(r.counter)
+        }
+        async fn checkpoint(
+            &self,
+            key: &str,
+            _o: &str,
+            counter: u64,
+            s: &str,
+        ) -> Result<u64, WorkerError> {
+            self.checkpoints
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut rows = self.rows.lock().unwrap();
+            let r = rows.get_mut(key).ok_or("no lease")?;
+            r.checkpoint = Some(s.to_string());
+            r.counter = counter + 1;
+            Ok(r.counter)
+        }
+        async fn mark_complete(&self, key: &str, _o: &str, _c: u64) -> Result<(), WorkerError> {
+            let mut rows = self.rows.lock().unwrap();
+            let r = rows.get_mut(key).ok_or("no lease")?;
+            r.completed = true;
+            Ok(())
+        }
+        async fn release(&self, key: &str, _o: &str, counter: u64) -> Result<(), WorkerError> {
+            let mut rows = self.rows.lock().unwrap();
+            let r = rows.get_mut(key).ok_or("no lease")?;
+            r.owner = None;
+            r.counter = counter + 1;
+            Ok(())
+        }
+        async fn delete_lease(&self, key: &str) -> Result<(), WorkerError> {
+            let mut rows = self.rows.lock().unwrap();
+            if rows.get(key).map(|r| r.completed).unwrap_or(false) {
+                rows.remove(key);
+            }
+            Ok(())
+        }
+        async fn create_shard_lease(
+            &self,
+            key: &str,
+            parents: &[ShardId],
+            checkpoint: Option<&str>,
+        ) -> Result<(), WorkerError> {
+            self.rows
+                .lock()
+                .unwrap()
+                .entry(key.to_string())
+                .or_insert_with(|| State {
+                    parents: parents.to_vec(),
+                    checkpoint: checkpoint.map(|s| s.to_string()),
+                    ..Default::default()
+                });
+            Ok(())
+        }
+        async fn try_acquire_leadership(
+            &self,
+            key: &str,
+            owner: &str,
+            expected: Option<u64>,
+        ) -> Result<Option<u64>, WorkerError> {
+            let mut rows = self.rows.lock().unwrap();
+            match expected {
+                None => {
+                    if rows.contains_key(key) {
+                        return Ok(None);
+                    }
+                    rows.insert(
+                        key.to_string(),
+                        State {
+                            owner: Some(owner.to_string()),
+                            counter: 1,
+                            ..Default::default()
+                        },
+                    );
+                    Ok(Some(1))
+                }
+                Some(c) => match rows.get_mut(key) {
+                    Some(r) if r.counter == c => {
+                        r.owner = Some(owner.to_string());
+                        r.counter = c + 1;
+                        Ok(Some(c + 1))
+                    }
+                    _ => Ok(None),
+                },
+            }
+        }
+    }
+
+    /// Source that serves one shard's records in single-record batches (so a
+    /// pass delivers N batches) and stays open until drained, then SHARD_ENDs.
+    struct PagedSource {
+        records: Vec<Record>,
+        /// Count of GetRecords calls that returned data (for redelivery checks).
+        served: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl AsyncStreamSource for PagedSource {
+        async fn describe_shards(&self) -> Result<Vec<ShardMeta>, WorkerError> {
+            Ok(vec![ShardMeta {
+                id: "s0".into(),
+                parents: vec![],
+            }])
+        }
+        async fn get_records(
+            &self,
+            _shard: &str,
+            after: Option<String>,
+        ) -> Result<RecordBatch, WorkerError> {
+            let idx = match after {
+                None => 0,
+                Some(tok) => match self.records.iter().position(|r| r.seq == tok) {
+                    Some(i) => i + 1,
+                    None => 0,
+                },
+            };
+            let (records, shard_end) = if idx < self.records.len() {
+                (
+                    vec![self.records[idx].clone()],
+                    idx + 1 == self.records.len(),
+                )
+            } else {
+                (vec![], true)
+            };
+            for r in &records {
+                self.served.lock().unwrap().push(r.seq.clone());
+            }
+            Ok(RecordBatch {
+                records,
+                shard_end,
+                millis_behind_latest: None,
+            })
+        }
+    }
+
+    fn paged_records(n: usize) -> Vec<Record> {
+        (1..=n).map(|i| rec("s0", &format!("{i:04}"))).collect()
+    }
+
+    struct AckAllFactory;
+    impl ShardConsumerFactory for AckAllFactory {
+        fn create(&self, _shard: &ShardId) -> Box<dyn AsyncShardConsumer + Send> {
+            struct A;
+            #[async_trait::async_trait]
+            impl AsyncShardConsumer for A {
+                async fn deliver(
+                    &mut self,
+                    records: &[Record],
+                ) -> Result<Option<String>, WorkerError> {
+                    Ok(records.last().map(|r| r.seq.clone()))
+                }
+                async fn shard_ended(&mut self) -> Result<(), WorkerError> {
+                    Ok(())
+                }
+            }
+            Box::new(A)
+        }
+    }
+
+    fn defer_fleet(
+        n_records: usize,
+        interval_ms: Option<u64>,
+    ) -> (
+        Fleet<PagedSource, CountingLeases>,
+        CountingLeases,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let served = Arc::new(Mutex::new(Vec::new()));
+        let source = PagedSource {
+            records: paged_records(n_records),
+            served: served.clone(),
+        };
+        let leases = CountingLeases::default();
+        let fleet = Fleet::new(
+            source,
+            leases.clone(),
+            Arc::new(AckAllFactory),
+            FleetConfig {
+                owner: "w1".into(),
+                max_leases: 100,
+                lease_duration_ms: 100_000,
+                poll_interval_ms: 1,
+                initial_position: InitialPosition::default(),
+            },
+        )
+        .with_checkpoint_interval(interval_ms);
+        (fleet, leases, served)
+    }
+
+    #[tokio::test]
+    async fn no_interval_checkpoints_every_batch() {
+        // Parity: interval unset ⇒ one durable checkpoint write per delivered
+        // batch (prior behavior), 20 batches ⇒ 20 checkpoint writes.
+        let (fleet, leases, _) = defer_fleet(20, None);
+        fleet.run_until_complete(10).await.unwrap();
+        assert_eq!(
+            leases.checkpoints.load(std::sync::atomic::Ordering::SeqCst),
+            20,
+            "per-batch checkpointing when interval is unset"
+        );
+        let rows = leases.rows.lock().unwrap();
+        assert!(rows.get("s0").unwrap().completed);
+        assert_eq!(rows.get("s0").unwrap().checkpoint.as_deref(), Some("0020"));
+    }
+
+    #[tokio::test]
+    async fn interval_defers_checkpoints_and_flushes_at_shard_end() {
+        // With a large interval, the 20 in-pass acks produce ZERO interval
+        // persists; the single durable write is the mandatory shard-end flush,
+        // and it carries the final ack. 20x write reduction, nothing lost.
+        let (fleet, leases, _) = defer_fleet(20, Some(60_000));
+        fleet.run_until_complete(10).await.unwrap();
+        assert_eq!(
+            leases.checkpoints.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "single flush at shard end instead of 20 per-batch writes"
+        );
+        let rows = leases.rows.lock().unwrap();
+        assert!(rows.get("s0").unwrap().completed);
+        assert_eq!(
+            rows.get("s0").unwrap().checkpoint.as_deref(),
+            Some("0020"),
+            "shard-end flush persists the final acked seq before mark_complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn interval_elapsed_persists_midstream() {
+        // A tiny interval (1ms) with a slow-enough stream persists midstream:
+        // more than the single shard-end flush, but the final durable value is
+        // still the last ack.
+        struct SlowPaged(PagedSource);
+        #[async_trait::async_trait]
+        impl AsyncStreamSource for SlowPaged {
+            async fn describe_shards(&self) -> Result<Vec<ShardMeta>, WorkerError> {
+                self.0.describe_shards().await
+            }
+            async fn get_records(
+                &self,
+                shard: &str,
+                after: Option<String>,
+            ) -> Result<RecordBatch, WorkerError> {
+                tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+                self.0.get_records(shard, after).await
+            }
+        }
+        let leases = CountingLeases::default();
+        let fleet = Fleet::new(
+            SlowPaged(PagedSource {
+                records: paged_records(10),
+                served: Arc::new(Mutex::new(Vec::new())),
+            }),
+            leases.clone(),
+            Arc::new(AckAllFactory),
+            FleetConfig {
+                owner: "w1".into(),
+                max_leases: 100,
+                lease_duration_ms: 100_000,
+                poll_interval_ms: 1,
+                initial_position: InitialPosition::default(),
+            },
+        )
+        .with_checkpoint_interval(Some(1));
+        fleet.run_until_complete(10).await.unwrap();
+        let n = leases.checkpoints.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (2..=10).contains(&n),
+            "expected midstream interval persists (2..=10 writes), got {n}"
+        );
+        let rows = leases.rows.lock().unwrap();
+        assert_eq!(rows.get("s0").unwrap().checkpoint.as_deref(), Some("0010"));
+    }
+
+    #[tokio::test]
+    async fn deferred_resume_does_not_redeliver_across_passes() {
+        // The resume-from-pending rule: with deferral active across MULTIPLE
+        // cycles (open shard, records trickling in), no record is served twice
+        // in steady state — the pass resumes after the in-memory pending ack,
+        // not the stale durable checkpoint.
+        struct TrickleSource {
+            all: Vec<Record>,
+            visible: Arc<std::sync::atomic::AtomicUsize>,
+            served: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl AsyncStreamSource for TrickleSource {
+            async fn describe_shards(&self) -> Result<Vec<ShardMeta>, WorkerError> {
+                Ok(vec![ShardMeta {
+                    id: "s0".into(),
+                    parents: vec![],
+                }])
+            }
+            async fn get_records(
+                &self,
+                _shard: &str,
+                after: Option<String>,
+            ) -> Result<RecordBatch, WorkerError> {
+                let upto = self
+                    .visible
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .min(self.all.len());
+                let idx = match after {
+                    None => 0,
+                    Some(tok) => match self.all.iter().position(|r| r.seq == tok) {
+                        Some(i) => i + 1,
+                        None => 0,
+                    },
+                };
+                // Reveal one more record for the NEXT cycle.
+                self.visible
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let records: Vec<Record> = self.all[idx..upto].to_vec();
+                for r in &records {
+                    self.served.lock().unwrap().push(r.seq.clone());
+                }
+                Ok(RecordBatch {
+                    records,
+                    shard_end: upto == self.all.len(),
+                    millis_behind_latest: None,
+                })
+            }
+        }
+        let served = Arc::new(Mutex::new(Vec::new()));
+        let fleet = Fleet::new(
+            TrickleSource {
+                all: paged_records(6),
+                visible: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+                served: served.clone(),
+            },
+            CountingLeases::default(),
+            Arc::new(AckAllFactory),
+            FleetConfig {
+                owner: "w1".into(),
+                max_leases: 100,
+                lease_duration_ms: 100_000,
+                poll_interval_ms: 1,
+                initial_position: InitialPosition::default(),
+            },
+        )
+        .with_checkpoint_interval(Some(60_000));
+        fleet.run_until_complete(20).await.unwrap();
+        let mut got = served.lock().unwrap().clone();
+        let total = got.len();
+        got.sort();
+        got.dedup();
+        assert_eq!(
+            (got.len(), total),
+            (6, 6),
+            "each record served exactly once across cycles under deferral"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_owned_flushes_pending_checkpoint() {
+        // Graceful shutdown mid-deferral: release_owned persists the pending
+        // high-water mark so a successor resumes without redelivery.
+        struct OpenPaged {
+            records: Vec<Record>,
+        }
+        #[async_trait::async_trait]
+        impl AsyncStreamSource for OpenPaged {
+            async fn describe_shards(&self) -> Result<Vec<ShardMeta>, WorkerError> {
+                Ok(vec![ShardMeta {
+                    id: "s0".into(),
+                    parents: vec![],
+                }])
+            }
+            async fn get_records(
+                &self,
+                _shard: &str,
+                after: Option<String>,
+            ) -> Result<RecordBatch, WorkerError> {
+                let idx = match after {
+                    None => 0,
+                    Some(tok) => match self.records.iter().position(|r| r.seq == tok) {
+                        Some(i) => i + 1,
+                        None => 0,
+                    },
+                };
+                Ok(RecordBatch {
+                    records: self.records[idx..].to_vec(),
+                    shard_end: false, // open shard — no shard-end flush path
+                    millis_behind_latest: None,
+                })
+            }
+        }
+        let leases = CountingLeases::default();
+        let fleet = Fleet::new(
+            OpenPaged {
+                records: paged_records(5),
+            },
+            leases.clone(),
+            Arc::new(AckAllFactory),
+            FleetConfig {
+                owner: "w1".into(),
+                max_leases: 100,
+                lease_duration_ms: 100_000,
+                poll_interval_ms: 1,
+                initial_position: InitialPosition::default(),
+            },
+        )
+        .with_checkpoint_interval(Some(60_000));
+        // One cycle: delivers all 5 (acked in memory, not persisted — open
+        // shard, huge interval).
+        fleet.run_until_complete(1).await.unwrap();
+        assert_eq!(
+            leases.checkpoints.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing persisted before release"
+        );
+        let released = fleet.release_owned().await.unwrap();
+        assert!(
+            released >= 1,
+            "shard lease released (leader sentinel may also count)"
+        );
+        let rows = leases.rows.lock().unwrap();
+        assert_eq!(
+            rows.get("s0").unwrap().checkpoint.as_deref(),
+            Some("0005"),
+            "release flushed the pending high-water mark"
+        );
+        assert!(rows.get("s0").unwrap().owner.is_none(), "lease released");
     }
 }

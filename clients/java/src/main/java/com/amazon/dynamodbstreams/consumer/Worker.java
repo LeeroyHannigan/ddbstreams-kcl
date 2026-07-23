@@ -167,6 +167,9 @@ public final class Worker {
         if (config.maxProcessingConcurrency != null) {
             e.put("DDB_STREAMS_CONSUMER_MAX_PROCESSING_CONCURRENCY", config.maxProcessingConcurrency.toString());
         }
+        if (config.checkpointIntervalMs != null) {
+            e.put("DDB_STREAMS_CONSUMER_CHECKPOINT_INTERVAL_MS", config.checkpointIntervalMs.toString());
+        }
         if (config.leaseDurationMs != null) {
             e.put("DDB_STREAMS_CONSUMER_LEASE_DURATION_MS", config.leaseDurationMs.toString());
         }

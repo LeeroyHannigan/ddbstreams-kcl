@@ -129,6 +129,8 @@ struct Config {
     /// fetched, buffered, and processed at once (None = unbounded, one
     /// concurrent task per shard).
     max_processing_concurrency: Option<usize>,
+    /// Optional deferred-checkpoint interval in ms (None = persist per batch).
+    checkpoint_interval_ms: Option<u64>,
     /// Billing mode + PITR applied when the lease table is auto-created.
     lease_table_config: LeaseTableConfig,
 }
@@ -161,6 +163,12 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|&n| n >= 1);
+        // Optional deferred-checkpoint interval. Absent, unparseable, or 0 =>
+        // None (persist per batch), matching Fleet::with_checkpoint_interval.
+        let checkpoint_interval_ms = std::env::var("DDB_STREAMS_CONSUMER_CHECKPOINT_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n >= 1);
         let lease_table_config = {
             let billing = match std::env::var("DDB_STREAMS_CONSUMER_LEASE_BILLING_MODE")
                 .unwrap_or_default()
@@ -199,6 +207,7 @@ impl Config {
             ),
             max_records,
             max_processing_concurrency,
+            checkpoint_interval_ms,
             lease_table_config,
         })
     }
@@ -232,11 +241,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ipc = Ipc::new(tokio::io::stdout());
     ipc.spawn_reader(tokio::io::stdin());
 
-    // Graceful stop on SIGINT/SIGTERM.
+    // Graceful stop on SIGINT/SIGTERM. `ctrl_c()` covers SIGINT (and the
+    // Windows console event); SIGTERM — what Kubernetes, systemd, and process
+    // supervisors actually send — needs its own unix handler. Without it the
+    // default action kills the process instantly and `graceful_handoff`
+    // (client notify -> deferred-checkpoint flush -> lease release) never
+    // runs.
     {
         let ipc = ipc.clone();
         tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("install SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
             eprintln!("[sidecar] signal received, stopping");
             ipc.request_stop();
         });
@@ -256,7 +283,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             initial_position: cfg.initial_position,
         },
     )
-    .with_max_processing_concurrency(cfg.max_processing_concurrency);
+    .with_max_processing_concurrency(cfg.max_processing_concurrency)
+    .with_checkpoint_interval(cfg.checkpoint_interval_ms);
 
     // Model A: if the standard OTEL exporter env var is set, attach the OTLP
     // metrics sink (feature-gated so the default build has no OTEL deps).
@@ -346,6 +374,7 @@ mod tests {
         "DDB_STREAMS_CONSUMER_GRACEFUL_SHUTDOWN_MS",
         "DDB_STREAMS_CONSUMER_MAX_RECORDS",
         "DDB_STREAMS_CONSUMER_MAX_PROCESSING_CONCURRENCY",
+        "DDB_STREAMS_CONSUMER_CHECKPOINT_INTERVAL_MS",
         "DDB_STREAMS_CONSUMER_LEASE_BILLING_MODE",
         "DDB_STREAMS_CONSUMER_LEASE_READ_CAPACITY",
         "DDB_STREAMS_CONSUMER_LEASE_WRITE_CAPACITY",
@@ -389,6 +418,7 @@ mod tests {
         // Knob defaults: no explicit GetRecords limit, on-demand billing, no PITR.
         assert_eq!(c.max_records, None);
         assert_eq!(c.max_processing_concurrency, None);
+        assert_eq!(c.checkpoint_interval_ms, None);
         assert_eq!(c.lease_table_config.billing, LeaseBilling::PayPerRequest);
         assert!(!c.lease_table_config.pitr);
         clear();
@@ -407,6 +437,7 @@ mod tests {
         std::env::set_var("DDB_STREAMS_CONSUMER_CYCLE_INTERVAL_MS", "250");
         std::env::set_var("DDB_STREAMS_CONSUMER_MAX_RECORDS", "250");
         std::env::set_var("DDB_STREAMS_CONSUMER_MAX_PROCESSING_CONCURRENCY", "4");
+        std::env::set_var("DDB_STREAMS_CONSUMER_CHECKPOINT_INTERVAL_MS", "5000");
         std::env::set_var("DDB_STREAMS_CONSUMER_LEASE_BILLING_MODE", "provisioned");
         std::env::set_var("DDB_STREAMS_CONSUMER_LEASE_READ_CAPACITY", "7");
         std::env::set_var("DDB_STREAMS_CONSUMER_LEASE_WRITE_CAPACITY", "9");
@@ -415,6 +446,7 @@ mod tests {
         assert_eq!(c.owner, "worker-9");
         assert_eq!(c.max_leases, 5);
         assert_eq!(c.max_processing_concurrency, Some(4));
+        assert_eq!(c.checkpoint_interval_ms, Some(5000));
         assert_eq!(c.lease_duration_ms, 3000);
         assert_eq!(c.poll_interval_ms, 200);
         assert_eq!(c.cycle_interval_ms, 250);

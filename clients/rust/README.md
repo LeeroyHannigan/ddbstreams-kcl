@@ -101,6 +101,15 @@ concurrent task per shard). The trade-off: with many active shards and a small
 pool, a cold shard waits longer between polls (higher iterator age) — the value
 is a footprint-vs-latency dial.
 
+## Checkpoint interval: `checkpoint_interval_ms`
+
+`checkpoint_interval_ms` (optional) caps durable checkpoint writes to at most
+one per interval per shard instead of one per delivered batch. Unset (the
+default) checkpoints per batch — the prior behavior. On a crash, up to one
+interval of already-acked records may be redelivered, so handlers must be
+idempotent (the same at-least-once contract, a wider window). The pending
+checkpoint is flushed at shard end and on graceful shutdown.
+
 ## Record format: typed by default, native or DynamoDB JSON views
 
 Each `Record` exposes item images **two** ways:
