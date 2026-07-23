@@ -16,6 +16,7 @@ public final class WorkerConfig {
     final Long pollIntervalMs;
     final Long cycleIntervalMs;
     final Integer maxProcessingConcurrency;
+    final Integer checkpointIntervalMs;
     final InitialPosition initialPosition;
     final String sidecarPath;
     final List<String> sidecarCmd;
@@ -32,6 +33,7 @@ public final class WorkerConfig {
         this.pollIntervalMs = b.pollIntervalMs;
         this.cycleIntervalMs = b.cycleIntervalMs;
         this.maxProcessingConcurrency = b.maxProcessingConcurrency;
+        this.checkpointIntervalMs = b.checkpointIntervalMs;
         this.initialPosition = b.initialPosition;
         this.sidecarPath = b.sidecarPath;
         this.sidecarCmd = b.sidecarCmd;
@@ -54,6 +56,7 @@ public final class WorkerConfig {
         private Long pollIntervalMs;
         private Long cycleIntervalMs;
         private Integer maxProcessingConcurrency;
+        private Integer checkpointIntervalMs;
         private InitialPosition initialPosition;
         private String sidecarPath;
         private List<String> sidecarCmd;
@@ -104,6 +107,14 @@ public final class WorkerConfig {
          *  preserves at-least-once + per-item + per-shard ordering. */
         public Builder maxProcessingConcurrency(int v) {
             this.maxProcessingConcurrency = v;
+            return this;
+        }
+
+        /** Throttle on how often progress is checkpointed (opt-in). Unset = per-batch default.
+         *  Larger intervals reduce lease-table writes at the cost of more re-delivery on
+         *  restart; preserves at-least-once + per-item + per-shard ordering. */
+        public Builder checkpointIntervalMs(int v) {
+            this.checkpointIntervalMs = v;
             return this;
         }
 

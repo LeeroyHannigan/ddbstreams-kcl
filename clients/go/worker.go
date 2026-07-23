@@ -77,6 +77,11 @@ type Config struct {
 	// stays O(max) as shard count grows; preserves at-least-once + per-item +
 	// per-shard ordering.
 	MaxProcessingConcurrency int
+	// CheckpointIntervalMs throttles how often progress is checkpointed
+	// (opt-in; 0 = per-batch default). Larger intervals reduce lease-table
+	// writes at the cost of more re-delivery on restart; preserves
+	// at-least-once + per-item + per-shard ordering.
+	CheckpointIntervalMs int
 	// InitialPosition selects where a freshly-seeded shard begins reading:
 	// TrimHorizon (default) or Latest.
 	InitialPosition InitialPosition
@@ -133,6 +138,9 @@ func (w *Worker) env() []string {
 	}
 	if w.cfg.MaxProcessingConcurrency > 0 {
 		add("DDB_STREAMS_CONSUMER_MAX_PROCESSING_CONCURRENCY", strconv.Itoa(w.cfg.MaxProcessingConcurrency))
+	}
+	if w.cfg.CheckpointIntervalMs > 0 {
+		add("DDB_STREAMS_CONSUMER_CHECKPOINT_INTERVAL_MS", strconv.Itoa(w.cfg.CheckpointIntervalMs))
 	}
 	if w.cfg.LeaseDurationMS > 0 {
 		add("DDB_STREAMS_CONSUMER_LEASE_DURATION_MS", strconv.Itoa(w.cfg.LeaseDurationMS))

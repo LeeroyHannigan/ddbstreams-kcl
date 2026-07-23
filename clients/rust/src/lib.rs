@@ -330,6 +330,7 @@ pub struct WorkerBuilder {
     initial_position: InitialPosition,
     processor: Option<Arc<dyn RecordProcessorFactory>>,
     max_processing_concurrency: Option<usize>,
+    checkpoint_interval_ms: Option<u64>,
 }
 
 impl Default for WorkerBuilder {
@@ -346,6 +347,7 @@ impl Default for WorkerBuilder {
             initial_position: InitialPosition::default(),
             processor: None,
             max_processing_concurrency: None,
+            checkpoint_interval_ms: None,
         }
     }
 }
@@ -431,6 +433,22 @@ impl WorkerBuilder {
         self
     }
 
+    /// Defer durable checkpoints to **at most one write per `ms` interval per
+    /// shard** (opt-in).
+    ///
+    /// Unset (the default) persists a checkpoint per delivered batch — the
+    /// prior behavior. Setting `ms` coalesces checkpoint writes so a shard
+    /// records its progress at most once per interval, trading checkpoint
+    /// I/O for a wider redelivery window: on a crash, up to one interval of
+    /// already-acked records may be redelivered. Delivery stays at-least-once
+    /// and per-item / per-shard ordering is unchanged; only the durable
+    /// checkpoint cadence moves. The pending checkpoint is flushed at shard
+    /// end and on graceful shutdown. `0` is treated as unset (per-batch).
+    pub fn checkpoint_interval_ms(mut self, ms: u64) -> Self {
+        self.checkpoint_interval_ms = Some(ms);
+        self
+    }
+
     /// Resolve AWS clients and construct the [`Worker`].
     pub async fn build(self) -> Result<Worker, Error> {
         let stream_arn = self.stream_arn.ok_or("stream_arn is required")?;
@@ -471,7 +489,8 @@ impl WorkerBuilder {
                 initial_position: self.initial_position,
             },
         )
-        .with_max_processing_concurrency(self.max_processing_concurrency);
+        .with_max_processing_concurrency(self.max_processing_concurrency)
+        .with_checkpoint_interval(self.checkpoint_interval_ms);
 
         Ok(Worker {
             fleet,

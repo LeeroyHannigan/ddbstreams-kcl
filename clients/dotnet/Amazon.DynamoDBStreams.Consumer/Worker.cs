@@ -45,6 +45,11 @@ public sealed class WorkerConfig
     /// preserves at-least-once + per-item + per-shard ordering.</summary>
     public int? MaxProcessingConcurrency { get; set; }
 
+    /// <summary>Throttle on how often progress is checkpointed (opt-in). Unset = per-batch default.
+    /// Larger intervals reduce lease-table writes at the cost of more re-delivery on restart;
+    /// preserves at-least-once + per-item + per-shard ordering.</summary>
+    public int? CheckpointIntervalMs { get; set; }
+
     /// <summary>Lease duration in milliseconds. Optional.</summary>
     public long? LeaseDurationMs { get; set; }
 
@@ -268,6 +273,10 @@ public sealed class Worker
         if (_config.MaxProcessingConcurrency is { } mpc)
         {
             e["DDB_STREAMS_CONSUMER_MAX_PROCESSING_CONCURRENCY"] = mpc.ToString();
+        }
+        if (_config.CheckpointIntervalMs is { } ci)
+        {
+            e["DDB_STREAMS_CONSUMER_CHECKPOINT_INTERVAL_MS"] = ci.ToString();
         }
         if (_config.LeaseDurationMs is { } ld)
         {

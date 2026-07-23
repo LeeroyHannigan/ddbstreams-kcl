@@ -38,6 +38,8 @@ export interface WorkerConfig {
    *  Bounds concurrent record delivery to keep footprint O(max) as shard count grows;
    *  preserves at-least-once + per-item + per-shard ordering. */
   maxProcessingConcurrency?: number;
+  /** How often (ms) to flush shard checkpoints. Unset = sidecar default. */
+  checkpointIntervalMs?: number;
   /** Where to start reading a shard with no checkpoint: `InitialPosition.TrimHorizon`
    *  (default) or `InitialPosition.Latest`. A bare `'TRIM_HORIZON'`/`'LATEST'` also works. */
   initialPosition?: InitialPosition;
@@ -92,6 +94,7 @@ export class Worker {
     if (c.pollIntervalMs != null) env.DDB_STREAMS_CONSUMER_POLL_INTERVAL_MS = String(c.pollIntervalMs);
     if (c.cycleIntervalMs != null) env.DDB_STREAMS_CONSUMER_CYCLE_INTERVAL_MS = String(c.cycleIntervalMs);
     if (c.maxProcessingConcurrency != null) env.DDB_STREAMS_CONSUMER_MAX_PROCESSING_CONCURRENCY = String(c.maxProcessingConcurrency);
+    if (c.checkpointIntervalMs != null) env.DDB_STREAMS_CONSUMER_CHECKPOINT_INTERVAL_MS = String(c.checkpointIntervalMs);
     if (c.initialPosition != null) env.DDB_STREAMS_CONSUMER_INITIAL_POSITION = String(c.initialPosition).trim().toUpperCase();
     return env;
   }
