@@ -241,11 +241,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ipc = Ipc::new(tokio::io::stdout());
     ipc.spawn_reader(tokio::io::stdin());
 
-    // Graceful stop on SIGINT/SIGTERM.
+    // Graceful stop on SIGINT/SIGTERM. `ctrl_c()` covers SIGINT (and the
+    // Windows console event); SIGTERM — what Kubernetes, systemd, and process
+    // supervisors actually send — needs its own unix handler. Without it the
+    // default action kills the process instantly and `graceful_handoff`
+    // (client notify -> deferred-checkpoint flush -> lease release) never
+    // runs.
     {
         let ipc = ipc.clone();
         tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("install SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
             eprintln!("[sidecar] signal received, stopping");
             ipc.request_stop();
         });
