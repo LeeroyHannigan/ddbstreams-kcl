@@ -265,25 +265,20 @@ struct ShardSched {
 const MAX_IDLE_BACKOFF_MS: u64 = 5_000;
 
 /// A unit of pool work: one shard pass, queued for a pool worker. The lease
-/// counter travels WITH the item: the keep-alive task removes an item from the
-/// queue before renewing (and reinserts it with the advanced counter), so a
-/// pool worker can never claim a shard whose counter is being advanced under
-/// it — that would read as a false lease loss at checkpoint time.
+/// counter travels with the item so a claiming worker checkpoints against the
+/// counter it last read.
 struct PoolItem {
     shard: ShardId,
     counter: u64,
     checkpoint: Option<String>,
     enqueued: Instant,
-    last_renewed: Instant,
 }
 
-/// Queue shared between the enqueue step, the `k` pool workers, and the lease
-/// keep-alive task. `renewing` counts items temporarily extracted for renewal;
-/// workers only terminate when the queue is empty AND nothing is mid-renewal
-/// (a renewed item re-enters the queue).
+/// Queue shared between the enqueue step and the `k` pool workers. A worker
+/// terminates when the queue is empty (per-worker heartbeat holds the leases
+/// of any shards still waiting — no keep-alive renewal needed).
 struct PoolState {
     queue: std::collections::VecDeque<PoolItem>,
-    renewing: usize,
 }
 
 /// What a single shard pass observed — drives the idle-backoff schedule.
@@ -615,7 +610,6 @@ where
                         counter,
                         checkpoint,
                         enqueued: now,
-                        last_renewed: now,
                     });
                 }
             }
@@ -637,72 +631,9 @@ where
         }
 
         self.metrics.on_processing_queue_depth(due.len() as u64);
-        let pool = Arc::new(std::sync::Mutex::new(PoolState {
-            queue: due,
-            renewing: 0,
-        }));
+        let pool = Arc::new(std::sync::Mutex::new(PoolState { queue: due }));
         let outcomes: Arc<std::sync::Mutex<Vec<(ShardId, PassOutcome)>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
-        let done = Arc::new(tokio::sync::Notify::new());
-
-        // Keep-alive: renew leases of shards WAITING in the queue so they are
-        // never reaped while queued behind the pool. An item is extracted,
-        // renewed, and reinserted with its advanced counter — a pool worker can
-        // therefore never claim a counter that is mid-renewal.
-        let keepalive = {
-            let pool = pool.clone();
-            let leases = self.leases.clone();
-            let owner = self.config.owner.clone();
-            let done = done.clone();
-            // Renew a queued shard once it has waited a third of the lease
-            // duration — early enough that even a slow renewal never races the
-            // lease expiry.
-            let renew_after = Duration::from_millis((self.config.lease_duration_ms / 3).max(1));
-            let tick = Duration::from_millis((self.config.lease_duration_ms / 6).clamp(1, 1_000));
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = done.notified() => return,
-                        _ = tokio::time::sleep(tick) => {}
-                    }
-                    // Extract every stale item in one lock, renew without the
-                    // lock, reinsert (preserving arrival order among renewed).
-                    let now = Instant::now();
-                    let stale: Vec<PoolItem> = {
-                        let mut st = pool.lock().expect("pool mutex poisoned");
-                        let mut keep = VecDeque::with_capacity(st.queue.len());
-                        let mut stale = Vec::new();
-                        while let Some(item) = st.queue.pop_front() {
-                            if now.duration_since(item.last_renewed) >= renew_after {
-                                stale.push(item);
-                            } else {
-                                keep.push_back(item);
-                            }
-                        }
-                        st.queue = keep;
-                        st.renewing += stale.len();
-                        stale
-                    };
-                    let extracted = stale.len();
-                    let mut renewed = Vec::with_capacity(extracted);
-                    for mut item in stale {
-                        if let Ok(c) = leases.renew(&item.shard, &owner, item.counter).await {
-                            item.counter = c;
-                            item.last_renewed = Instant::now();
-                            renewed.push(item);
-                        }
-                        // Renewal failure = lease lost while queued: drop the
-                        // item; ownership resolves next cycle from the table.
-                    }
-                    let mut st = pool.lock().expect("pool mutex poisoned");
-                    st.renewing -= extracted.min(st.renewing);
-                    for item in renewed {
-                        st.queue.push_back(item);
-                    }
-                }
-            })
-        };
-
         // The pool: k workers, each looping { claim due shard → one pass }.
         let mut set: JoinSet<()> = JoinSet::new();
         for _ in 0..k {
@@ -720,16 +651,9 @@ where
                     let item = {
                         let mut st = pool.lock().expect("pool mutex poisoned");
                         match st.queue.pop_front() {
-                            Some(it) => Some(it),
-                            // Empty but items are mid-renewal: they'll re-enter;
-                            // yield and retry rather than exiting early.
-                            None if st.renewing > 0 => None,
+                            Some(it) => it,
                             None => break,
                         }
-                    };
-                    let Some(item) = item else {
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                        continue;
                     };
                     metrics.on_processing_slot_wait(
                         &item.shard,
@@ -756,8 +680,6 @@ where
             });
         }
         while set.join_next().await.is_some() {}
-        done.notify_waiters();
-        keepalive.abort();
 
         // Fold pass outcomes into the schedule: hot shards stay immediately
         // due; idle shards back off exponentially (capped); ended/stopped
