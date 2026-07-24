@@ -274,9 +274,9 @@ public sealed class Worker
         {
             e["DDB_STREAMS_CONSUMER_MAX_PROCESSING_CONCURRENCY"] = mpc.ToString();
         }
-        if (_config.CheckpointIntervalMs is { } ci)
+        if (_config.CheckpointIntervalMs is { } cim)
         {
-            e["DDB_STREAMS_CONSUMER_CHECKPOINT_INTERVAL_MS"] = ci.ToString();
+            e["DDB_STREAMS_CONSUMER_CHECKPOINT_INTERVAL_MS"] = cim.ToString();
         }
         if (_config.LeaseDurationMs is { } ld)
         {
