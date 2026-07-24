@@ -47,7 +47,9 @@ pub const LEADER_LEASE_KEY: &str = "__shard_sync_leader__";
 /// dependencies purely from the lease table it already scans for coordination.
 pub fn shard_metas_from_leases(rows: &[RawLease]) -> Vec<ShardMeta> {
     rows.iter()
-        .filter(|r| r.lease_key != LEADER_LEASE_KEY)
+        .filter(|r| {
+            r.lease_key != LEADER_LEASE_KEY && !crate::coordinator::is_heartbeat_key(&r.lease_key)
+        })
         .map(|r| ShardMeta {
             id: r.lease_key.clone(),
             parents: r.parents.clone(),
