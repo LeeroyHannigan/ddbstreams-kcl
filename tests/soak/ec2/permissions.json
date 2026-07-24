@@ -17,7 +17,7 @@
         "dynamodb:Scan",
         "dynamodb:BatchWriteItem"
       ],
-      "Resource": "arn:aws:dynamodb:us-east-1:964157134968:table/adsc-soak-*"
+      "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/adsc-soak-*"
     },
     {
       "Sid": "SoakTableStreams",
@@ -28,7 +28,7 @@
         "dynamodb:GetRecords",
         "dynamodb:ListStreams"
       ],
-      "Resource": "arn:aws:dynamodb:us-east-1:964157134968:table/adsc-soak-*/stream/*"
+      "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/adsc-soak-*/stream/*"
     }
   ]
 }
